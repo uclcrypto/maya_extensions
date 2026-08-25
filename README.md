@@ -41,25 +41,25 @@ All three crates share the same internal layout:
 ```
 <crate>/
 ├── Cargo.toml
-├── Cargo.lock              # Pinned dependency versions for reproducibility
+├── Cargo.lock              
 ├── src/
-│   ├── lib.rs              # Crate root, feature gates, module wiring
-│   ├── errors.rs           # ProofError / MPCError / R1CSError
+│   ├── lib.rs              
+│   ├── errors.rs           
 │   ├── generators.rs       # PedersenGens, BulletproofGens (CRS)
-│   ├── transcript.rs       # TranscriptProtocol trait (Fiat-Shamir interface)
+│   ├── transcript.rs       
 │   ├── hmac_transcript.rs  # HMAC-SHA256 transcript used by all protocols
 │   ├── inner_product_proof.rs  # k-ary folding inner-product argument
-│   ├── util.rs             # VecPoly/Poly arithmetic, scalar helpers (+ unit tests)
-│   ├── util_msm.rs         # Rayon-chunked multiscalar multiplication (feature `parallel`)
+│   ├── util.rs             
+│   ├── util_msm.rs         
 │   └── r1cs/
-│       ├── mod.rs                # Public R1CS API re-exports
-│       ├── constraint_system.rs  # ConstraintSystem trait
-│       ├── linear_combination.rs # LinearCombination, Variable
-│       ├── proof.rs              # R1CSProof (de)serialization
+│       ├── mod.rs                
+│       ├── constraint_system.rs  
+│       ├── linear_combination.rs 
+│       ├── proof.rs             
 │       ├── prover.rs             # Prover: commitments, blinding, proof generation
 │       └── verifier.rs           # Verifier: batched verification equation
 ├── benches/                # Criterion benchmark harnesses (see table above)
-└── docs/                   # Rustdoc protocol notes (rendered into `cargo doc`)
+└── docs/                  
 ```
 
 The three `src/` trees are deliberately near-identical: they differ only in the
