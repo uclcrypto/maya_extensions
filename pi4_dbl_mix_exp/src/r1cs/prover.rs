@@ -309,9 +309,11 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         D1_prime: Option<&[RistrettoPoint]>,
         D2_prime: Option<&[RistrettoPoint]>,
         r_prime2: Option<Scalar>,
-        alpha: Option<Scalar>,
-        A2_agg: Option<RistrettoPoint>,
-        B2_agg: Option<RistrettoPoint>,
+        alphas: Option<&[Scalar]>,
+        D1_raw: Option<&[RistrettoPoint]>,
+        D2_raw: Option<&[RistrettoPoint]>,
+        e_challenge: Option<&[Scalar]>,
+        block_size: usize,
     ) -> Result<R1CSProof, R1CSError> {
         use inner_product_proof::inner_product;
         use rand::thread_rng;
@@ -337,16 +339,13 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             use rand_chacha::ChaCha20Rng;
             use rand::SeedableRng;
 
-            //Step 1: The Deterministic Seed = H(state,"witness_rng"∣∣0x00∣∣self.v_blinding)
             let witness_seed = self.transcript.witness_rng_seed(self.v_blinding.as_bytes());
             let mut os_bytes = [0u8; 32];
 
-            //Step 2: The Fresh OS Entropy
             if std::env::var("MAYA_DETERMINISTIC").ok().as_deref() != Some("1") {
                 thread_rng().fill_bytes(&mut os_bytes);
             }
 
-            //Step 3: The Combination (XOR)
             let mut seed = [0u8; 32];
             for i in 0..32 {
                 seed[i] = witness_seed[i] ^ os_bytes[i];
@@ -677,43 +676,57 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             );
         }
 
-        // Dual-group consistency commitments
-        let dual_group_active = D1_prime.is_some() && D2_prime.is_some()
-            && r_prime2.is_some() && alpha.is_some()
-            && A2_agg.is_some() && B2_agg.is_some();
+        // Dual-group consistency commitments (per-voter alpha: one alpha_beta per block).
+          let dual_group_active = D1_prime.is_some() && D2_prime.is_some()
+            && r_prime2.is_some() && alphas.is_some()
+            && D1_raw.is_some() && D2_raw.is_some() && e_challenge.is_some();
 
         let mut y2   = Scalar::ZERO;
-        let mut beta = Scalar::ZERO;
+        let mut betas: Vec<Scalar> = Vec::new();
         let (S3_prime, S4_prime) = if dual_group_active {
             let d1 = D1_prime.unwrap();
             let d2 = D2_prime.unwrap();
-            let a2 = A2_agg.unwrap();
-            let b2 = B2_agg.unwrap();
+            let dr1 = D1_raw.unwrap();
+            let dr2 = D2_raw.unwrap();
+            let e = &e_challenge.unwrap()[0..k_original];
+            let num_anchors = alphas.unwrap().len();
+            if block_size == 0 || num_anchors * block_size != k_original
+                || dr1.len() != k_original || dr2.len() != k_original
+            {
+                return Err(R1CSError::InputLengthError);
+            }
             y2   = Scalar::random(&mut rng);
-            beta = Scalar::random(&mut rng);
+            betas = (0..num_anchors).map(|_| Scalar::random(&mut rng)).collect();
             let sl = &s_L_prime[0..k_original];
+
+            #[cfg(feature = "parallel")]
+            let e_beta: Vec<Scalar> = e.par_iter().enumerate()
+                .map(|(i, ei)| ei * betas[i / block_size]).collect();
+            #[cfg(not(feature = "parallel"))]
+            let e_beta: Vec<Scalar> = e.iter().enumerate()
+                .map(|(i, ei)| ei * betas[i / block_size]).collect();
 
             #[cfg(feature = "parallel")]
             let (s3, s4) = rayon::join(
                 || {
                     let s3_scalars: Vec<Scalar> = sl.iter().copied()
                         .chain(iter::once(y2))
-                        .chain(iter::once(beta))
+                        .chain(e_beta.iter().copied())
                         .collect();
                     let s3_points: Vec<RistrettoPoint> = d1.iter().copied()
                         .chain(iter::once(self.pc_gens.B))
-                        .chain(iter::once(a2))
+                        .chain(dr1.iter().copied())
                         .collect();
                     crate::util_msm::chunked_vartime_multiscalar_mul(&s3_scalars, &s3_points).compress()
                 },
                 || {
                     let s4_scalars: Vec<Scalar> = sl.iter().copied()
                         .chain(iter::once(y2))
-                        .chain(iter::once(beta))
+                        .chain(e_beta.iter().copied())
                         .collect();
                     let s4_points: Vec<RistrettoPoint> = d2.iter().copied()
                         .chain(iter::once(self.pc_gens.F2))
-                        .chain(iter::once(b2))
+                        .chain(dr2.iter().copied())
                         .collect();
                     crate::util_msm::chunked_vartime_multiscalar_mul(&s4_scalars, &s4_points).compress()
                 }
@@ -722,12 +735,12 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             #[cfg(not(feature = "parallel"))]
             let (s3, s4) = {
                 let s3_res = RistrettoPoint::vartime_multiscalar_mul(
-                    sl.iter().chain(iter::once(&y2)).chain(iter::once(&beta)),
-                    d1.iter().chain(iter::once(&self.pc_gens.B)).chain(iter::once(&a2)),
+                    sl.iter().chain(iter::once(&y2)).chain(e_beta.iter()),
+                    d1.iter().chain(iter::once(&self.pc_gens.B)).chain(dr1.iter()),
                 ).compress();
                 let s4_res = RistrettoPoint::vartime_multiscalar_mul(
-                    sl.iter().chain(iter::once(&y2)).chain(iter::once(&beta)),
-                    d2.iter().chain(iter::once(&self.pc_gens.F2)).chain(iter::once(&b2)),
+                    sl.iter().chain(iter::once(&y2)).chain(e_beta.iter()),
+                    d2.iter().chain(iter::once(&self.pc_gens.F2)).chain(dr2.iter()),
                 ).compress();
                 (s3_res, s4_res)
             };
@@ -741,11 +754,9 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         };
 
 
-        let S_K = if dual_group_active {
-            (self.pc_gens.B * beta).compress()
-        } else {
-            curve25519_dalek::ristretto::RistrettoPoint::identity().compress()
-        };
+        let S_Ks: Vec<CompressedRistretto> = betas.iter()
+            .map(|b| (self.pc_gens.B * b).compress())
+            .collect();
 
         let _tp = Instant::now();
         let mut lc_poly = util::VecPoly1::zero(k);
@@ -772,7 +783,9 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         if dual_group_active {
             self.transcript.commit_point(b"S3_prime", &S3_prime);
             self.transcript.commit_point(b"S4_prime", &S4_prime);
-            self.transcript.commit_point(b"S_K", &S_K);
+            for S_K in &S_Ks {
+                self.transcript.commit_point(b"S_K", S_K);
+            }
         }
 
         let x_prime = self.transcript.challenge_scalar(b"x_prime");
@@ -783,12 +796,14 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         let r_blinding = r_prime + rnd * x_prime;
 
         // Dual-group responses
-        let (r_blinding2, alpha_blinding) = if dual_group_active {
+        let (r_blinding2, alpha_blindings) = if dual_group_active {
             let rb2 = r_prime2.unwrap() + y2 * x_prime;
-            let ab  = beta * x_prime - alpha.unwrap();
+            let ab: Vec<Scalar> = betas.iter().zip(alphas.unwrap().iter())
+                .map(|(b, a)| b * x_prime - a)
+                .collect();
             (rb2, ab)
         } else {
-            (Scalar::ZERO, Scalar::ZERO)
+            (Scalar::ZERO, Vec::new())
         };
 
         self.transcript.commit_scalar(b"tc_x", &tc_x);
@@ -798,7 +813,9 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         self.transcript.commit_scalar(b"r_blinding", &r_blinding);
         if dual_group_active {
             self.transcript.commit_scalar(b"r_blinding2", &r_blinding2);
-            self.transcript.commit_scalar(b"alpha_blinding", &alpha_blinding);
+            for ab in &alpha_blindings {
+                self.transcript.commit_scalar(b"alpha_blinding", ab);
+            }
         }
 
         let lc_vec = lc_poly.eval(x_prime);
@@ -947,7 +964,9 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             e.zeroize();
         }
         y2.zeroize();
-        beta.zeroize();
+        for b in betas.iter_mut() {
+            b.zeroize();
+        }
 
         Ok(R1CSProof {
             A_I,
@@ -973,10 +992,10 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             S2_prime,
             S3_prime,
             S4_prime,
-            S_K,
+            S_Ks,
             r_blinding,
             r_blinding2,
-            alpha_blinding,
+            alpha_blindings,
             ecp_batched,
         })
     }

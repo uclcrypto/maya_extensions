@@ -98,7 +98,7 @@ pub enum MPCError {
 #[derive(Fail, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum R1CSError {
     ///
-    #[fail(display = "Shuffle zize must be more than 1.")]
+    #[fail(display = "Shuffle size must be more than 1.")]
     InputLengthError,
     /// Occurs when there are insufficient generators for the proof.
     #[fail(display = "Invalid generators size, too few generators for proof")]

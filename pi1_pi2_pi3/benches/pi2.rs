@@ -296,39 +296,41 @@ fn deterministic_rand_scalar(index: usize) -> Scalar {
 }
 
 // File I/O Helpers 
-fn write_ciphertexts(
-    path: &str,
+fn encode_ciphertexts(
     c1: &[RistrettoPoint],
     c2: &[RistrettoPoint],
     g: &RistrettoPoint,
     f: &RistrettoPoint,
     h: &RistrettoPoint,
-) -> std::io::Result<usize> {
+) -> Vec<u8> {
     let n = c1.len();
     assert_eq!(n, c2.len());
-    let file = File::create(path)?;
-    let mut w = BufWriter::new(file);
-    w.write_all(&(n as u64).to_le_bytes())?;
-
+    let mut buf = Vec::with_capacity(8 + (2 * n + 3) * 32);
+    buf.extend_from_slice(&(n as u64).to_le_bytes());
     #[cfg(feature = "parallel")]
     {
         let (c1_blob, c2_blob) = rayon::join(|| batch_compress(c1), || batch_compress(c2));
-        w.write_all(&c1_blob)?;
-        w.write_all(&c2_blob)?;
+        buf.extend_from_slice(&c1_blob);
+        buf.extend_from_slice(&c2_blob);
     }
     #[cfg(not(feature = "parallel"))]
     for pt in c1.iter().chain(c2.iter()) {
-        w.write_all(pt.compress().as_bytes())?;
+        buf.extend_from_slice(pt.compress().as_bytes());
     }
+    buf.extend_from_slice(g.compress().as_bytes());
+    buf.extend_from_slice(f.compress().as_bytes());
+    buf.extend_from_slice(h.compress().as_bytes());
+    buf
+}
 
-    w.write_all(g.compress().as_bytes())?;
-    w.write_all(f.compress().as_bytes())?;
-    w.write_all(h.compress().as_bytes())?;
-
+fn store_bytes(path: &str, bytes: &[u8]) -> std::io::Result<usize> {
+    let file = File::create(path)?;
+    let mut w = BufWriter::new(file);
+    w.write_all(bytes)?;
     w.flush()?;
     let fh = w.into_inner()?;
     fh.sync_all()?;
-    Ok(std::fs::metadata(path)?.len() as usize)
+    Ok(bytes.len())
 }
 
 fn read_ciphertexts(
@@ -715,17 +717,11 @@ fn custom_benchmark(c: &mut Criterion) {
         let n_input: usize = cfg.n_total();
         let n_padded = n_input + (k - 1) + 1;
 
-        let pc_gens = PedersenGens::default();
+        // Setup only 
+        let pc_gens_setup = PedersenGens::default();
 
         let mut rng = rand::thread_rng();
 
-        let g = pc_gens.B;
-        let f = pc_gens.F;
-
-        let t_table_start = Instant::now();
-        let g_table = RistrettoBasepointTable::create(&g);
-        let f_table = RistrettoBasepointTable::create(&f);
-        let t_table = t_table_start.elapsed();
 
         let rem = n_input % k;
         let circuit_n = if rem == 0 { n_input } else { n_input + (k - rem) };
@@ -742,25 +738,43 @@ fn custom_benchmark(c: &mut Criterion) {
         let c1_raw: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng)).collect();
         let c2_raw: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng)).collect();
 
-        let input_file_size = write_ciphertexts(
-            input_ciph_path, &c1_raw, &c2_raw, &g, &f, &pc_gens.B_blinding,
-        ).expect("write_ciphertexts failed");
+        // Untimed:  Generating and compressing it is not mixer work: the mixer receives the list from the bulletin board / previous mixer.
+        let input_blob = encode_ciphertexts(
+            &c1_raw, &c2_raw, &pc_gens_setup.B, &pc_gens_setup.F, &pc_gens_setup.B_blinding,
+        );
+        drop((c1_raw, c2_raw));
 
         // SINGLE-RUN PROVER
 
         // [1] CRS Genaration
+        // [0] Store the received input list to disk 
+        let t_store_start = Instant::now();
+        let input_file_size = store_bytes(input_ciph_path, &input_blob).expect("store input failed");
+        let t_store = t_store_start.elapsed();
+        drop(input_blob);
+
         let t_gen_start = Instant::now();
         #[cfg(feature = "parallel")]
-        let (bp_gens, (c1_bytes, c2_bytes, _g_rd, _f_rd, _h_rd)) = rayon::join(
-            || BulletproofGens::new(n_padded, 1),
+        let ((pc_gens, bp_gens), (c1_bytes, c2_bytes, _g_rd, _f_rd, _h_rd)) = rayon::join(
+            || rayon::join(|| PedersenGens::default(), || BulletproofGens::new(n_padded, 1)),
             || read_ciphertexts_raw(input_ciph_path).expect("read_ciphertexts_raw failed"),
         );
+        #[cfg(not(feature = "parallel"))]
+        let pc_gens = PedersenGens::default();
         #[cfg(not(feature = "parallel"))]
         let bp_gens = BulletproofGens::new(n_padded, 1);
         #[cfg(not(feature = "parallel"))]
         let (c1_bytes, c2_bytes, _g_rd, _f_rd, _h_rd) =
             read_ciphertexts_raw(input_ciph_path).expect("read_ciphertexts_raw failed");
         let t_gen = t_gen_start.elapsed();
+
+        let g = pc_gens.B;
+        let f = pc_gens.F;
+
+        let t_table_start = Instant::now();
+        let g_table = RistrettoBasepointTable::create(&g);
+        let f_table = RistrettoBasepointTable::create(&f);
+        let t_table = t_table_start.elapsed();
 
         let t_decomp_start = Instant::now();
         #[cfg(feature = "parallel")]
@@ -891,14 +905,18 @@ fn custom_benchmark(c: &mut Criterion) {
         let t_e_derive = t_e_start.elapsed();
 
         // [3] Verify
+        let t_parse_start = Instant::now();
         let c1_prime_c = blob_to_compressed(&c1p_r_bytes);
         let c2_prime_c = blob_to_compressed(&c2p_r_bytes);
         let c1_raw_c = blob_to_compressed(&c1_orig_bytes);
         let c2_raw_c = blob_to_compressed(&c2_orig_bytes);
         let f_gens_v: Vec<RistrettoPoint> = vec![v_pc_gens.F];
         let f_gens_v_c = compress_all_par(&f_gens_v);
-        let e_original_r = &input_padded_r[..n_input];
+        let t_parse = t_parse_start.elapsed();
+        
+
         let t_verify_start = Instant::now();
+        let e_original_r = &input_padded_r[..n_input];
         let mut verifier_transcript = Transcript::new(b"MAYA-Shuffle-v1");
         let result = KShuffleGadget::verify(
             &v_pc_gens, &v_bp_gens, &mut verifier_transcript,
@@ -914,6 +932,7 @@ fn custom_benchmark(c: &mut Criterion) {
         // PRINT TIMINGS
         let ms = |dur: std::time::Duration| dur.as_secs_f64() * 1000.0;
         let t_gen_ms         = ms(t_gen);
+        let t_store_ms       = ms(t_store);
         let t_decomp_ms      = ms(t_decomp);
         let t_table_ms       = ms(t_table);
         let t_shuffle_ms     = ms(t_shuffle);
@@ -924,11 +943,12 @@ fn custom_benchmark(c: &mut Criterion) {
         let t_v_gen_ms       = ms(t_v_gen);
         let t_e_derive_ms    = ms(t_e_derive);
         let t_verify_ms      = ms(t_verify);
-        let total_prover     = t_gen_ms + t_decomp_ms + t_table_ms + t_shuffle_ms + t_rerand_ms
+        let t_parse_ms       = ms(t_parse);
+        let total_prover     = t_store_ms + t_gen_ms + t_decomp_ms + t_table_ms + t_shuffle_ms + t_rerand_ms
                                + t_e_derive_p_ms + t_proof_gen_ms;
         let file_io          = t_file_write_ms;
         let total_prover_e2e = total_prover + file_io;
-        let total_verifier   = t_v_gen_ms + t_e_derive_ms + t_verify_ms;
+        let total_verifier   = t_v_gen_ms + t_e_derive_ms + t_parse_ms + t_verify_ms;
         let total_verifier_e2e = total_verifier;
         let proof_kb = proof_size as f64 / 1024.0;
         let thread_label = if cfg!(feature = "parallel") { "multi-threaded" } else { "single-threaded" };
@@ -945,7 +965,8 @@ fn custom_benchmark(c: &mut Criterion) {
         println!();
         println!("  PROVER:");
        // println!("    Folding depth:                d={}  k_fold={}", d, k);
-        println!("    CRS+DiskRead (wall):          {:>14.2} ms", t_gen_ms);
+        println!("    Store input (write + fsync):  {:>14.2} ms", t_store_ms);
+        println!("    CRS + DiskRead (wall time):          {:>14.2} ms", t_gen_ms);
         println!("    Fixed-base table:             {:>14.2} ms", t_table_ms);
         println!("    Batch decompress C1+C2:       {:>14.2} ms", t_decomp_ms);
         println!("    Permutation:                  {:>14.2} ms", t_shuffle_ms);
@@ -957,8 +978,9 @@ fn custom_benchmark(c: &mut Criterion) {
         println!("    Total E2E (incl. I/O):        {:>14.2} ms", total_prover_e2e);
         println!();
         println!("  VERIFIER:");
-        println!("    CRS+DiskRead (wall time):     {:>14.2} ms", t_v_gen_ms);
+        println!("    CRS + DiskRead (wall time):     {:>14.2} ms", t_v_gen_ms);
         println!("    Challenge e derivation:       {:>14.2} ms", t_e_derive_ms);
+        println!("    Parse compressed points:      {:>14.2} ms", t_parse_ms);
         println!("    Proof verification (*):       {:>14.2} ms", t_verify_ms);
         println!("    ────────────────────────────────────────────────");
         println!("    Total E2E:                    {:>14.2} ms", total_verifier_e2e);
@@ -972,9 +994,11 @@ fn custom_benchmark(c: &mut Criterion) {
         let label_v = format!("pi2/V/n{}/B{}x{}/{}", n_input, cfg.voters, cfg.questions(), cfg.b_label());
 
         if CRITERION_ENABLED {
-            println!("  (*) Computing averages via Criterion ({} samples)...", SAMPLES);
+            println!("  (*) Proof generation and verification times can vary across runs");
+            println!("     due to variable-time multi-scalar multiplications. Computing");
+            println!("     their average over multiple samples for more stable estimates:");
             println!();
-            println!("  Proof generation time via Criterion ({} samples)...", SAMPLES);
+            println!("  Proof generation time via Criterions ({} samples, adjust SAMPLES if needed)...", SAMPLES);
        
 
         // CRITERION: Prover
@@ -1039,7 +1063,7 @@ fn custom_benchmark(c: &mut Criterion) {
          }
 
         if CRITERION_ENABLED {
-            println!("  Proof verification time via Criterion ({} samples)...", SAMPLES);
+            println!("  Proof verification time via Criterions ({} samples, adjust SAMPLES if needed)...", SAMPLES);
        
 
         // CRITERION: Verifier
@@ -1191,8 +1215,8 @@ fn custom_benchmark(c: &mut Criterion) {
             println!("================================================================");
             println!("  Quick-check result - N={}  B={}  {}", r.n, r.voters, r.b_desc);
             println!();
-            println!("  Prover (excl. I/O):    {:>10.2} ms", averaged_prover(r));
-            println!("  Verifier (excl. I/O):  {:>10.2} ms", averaged_verifier(r));
+            println!("  Prover (E2E, incl. CRS + disk I/O):   {:>10.2} ms", averaged_prover(r));
+            println!("  Verifier (E2E, incl. CRS + disk I/O): {:>10.2} ms", averaged_verifier(r));
             println!("  Proof size:            {:>10} bytes", r.proof_bytes);
             println!();
             println!("  Build verification passed.");
