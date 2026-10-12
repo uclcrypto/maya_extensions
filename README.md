@@ -6,7 +6,9 @@ protocols (Pi_1 - Pi_5) built on top of the MAYA shuffle argument
 
 This repository is the reproducibility artifact accompanying the paper. It contains
 three self-contained Cargo crates, each an instantiation of the same MAYA R1CS
-prover/verifier core specialised to one family of protocols.
+prover/verifier core specialized to one family of protocols.
+
+More information about MAYA is available on the https://thaodoanvan.github.io/maya_website/.
 
 | Protocol | Description                                                     | Crate              | Benchmark          |
 |----------|-----------------------------------------------------------------|--------------------|--------------------|
@@ -54,7 +56,7 @@ All three crates share the same internal layout:
 │   └── r1cs/
 │       ├── mod.rs                
 │       ├── constraint_system.rs  
-│       ├── linear_combination.rs 
+│       ├── linear_combination.rs
 │       ├── proof.rs             
 │       ├── prover.rs             # Prover: commitments, blinding, proof generation
 │       └── verifier.rs           # Verifier: batched verification equation
