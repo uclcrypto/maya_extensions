@@ -1,22 +1,33 @@
-# MAYA Block-Permutation Extensions
+# MAYAsk: Swiss-Knife Extensions to MAYA
 
-Rust implementation and benchmarks for five block-permutation shuffle-argument
-protocols (Pi_1 - Pi_5) built on top of the MAYA shuffle argument
+Rust implementation and benchmarks of the MAYA extensions (Pi_1 - Pi_6) built on top of the MAYA shuffle argument
 (O(log n) proof size, Ristretto255).
 
 This repository is the reproducibility artifact accompanying the paper. It contains
-three self-contained Cargo crates, each an instantiation of the same MAYA R1CS
+four self-contained Cargo crates, each an instantiation of the same MAYA R1CS
 prover/verifier core specialized to one family of protocols.
 
 More information about MAYA is available on the https://thaodoanvan.github.io/maya_website/.
 
 | Protocol | Description                                                     | Crate              | Benchmark          |
 |----------|-----------------------------------------------------------------|--------------------|--------------------|
-| **Pi_1** | Fixed block size, single encryption key                         | `pi1_pi2_pi3`      | `benches/pi1.rs`   |
-| **Pi_2** | Mixed block sizes, single key                                   | `pi1_pi2_pi3`      | `benches/pi2.rs`   |
-| **Pi_3** | Multiple encryption keys, per-key (per-city) permutations       | `pi1_pi2_pi3`      | `benches/pi3.rs`   |
-| **Pi_4** | `DblMixExp`: shuffle-and-exponentiate, dual-key rerandomization | `pi4_dbl_mix_exp`  | `benches/pi4.rs`   |
-| **Pi_5** | `DecMix`: verifiable decryption mixnet                          | `pi5_dec_mix`      | `benches/pi5.rs`   |
+| **Pi_1** | Uniform blocks, single key                                                           | `pi1_pi2_pi3`            | `benches/pi1.rs`   |
+| **Pi_2** | Heterogeneous blocks, single key                                                     | `pi1_pi2_pi3`            | `benches/pi2.rs`   |
+| **Pi_3** | Multiple keys, each key with its own block structure                                 | `pi1_pi2_pi3`            | `benches/pi3.rs`   |
+| **Pi_4** | Decryption mixnet (one mixer): shuffle-and-partial-decryption                        | `pi4_dec_mix`            | `benches/pi4.rs`   |
+| **Pi_5** | Shuffle-and-exponentiate (`DbleMixExp`), one secret exponent per voter (block)       | `pi5_dbl_mix_exp`        | `benches/pi5.rs`   |
+| **Pi_6** | Shuffle-and-exponentiate (`DbleMixExp`), one secret exponent for all voters          | `pi6_dbl_mix_exp_single` | `benches/pi6.rs`   |
+
+Pi_5 and Pi_6 are two variants of `DbleMixExp`. Both shuffle pairs of ciphertexts under two keys with one block permutation,
+re-randomize both, and raise the second-key ciphertexts to a secret exponent
+anchored in a public value `K = g^alpha`. They differ only in how many exponents
+there are. For Pi_5, voter (block) `beta` has its own exponent `alpha_beta` and anchor
+  `K_beta`. For Pi_6, a single exponent `alpha` and anchor `K` for all
+    voters.
+ The `src/` trees of
+the two crates are identical. Only the benchmark harness differs (one anchor
+group covering all entries instead of one per block).
+
 
 
 ---
@@ -31,14 +42,13 @@ More information about MAYA is available on the https://thaodoanvan.github.io/ma
 ## Repository Structure
 
 ```
-.
-├── README.md
 ├── pi1_pi2_pi3/            # Pi_1, Pi_2, Pi_3 (single-group shuffle)
-├── pi4_dbl_mix_exp/        # Pi_4 (DblMixExp, dual-group shuffle-and-exponentiate)
-└── pi5_dec_mix/            # Pi_5 (decryption mixnet)
+├── pi4_dec_mix/            # Pi_4 (decryption mixnet)
+├── pi5_dbl_mix_exp/        # Pi_5 (DbleMixExp, one exponent per voter)
+└── pi6_dbl_mix_exp_single/ # Pi_6 (DbleMixExp, one exponent for all voters)
 ```
 
-All three crates share the same internal layout:
+All four crates share the same internal layout:
 
 ```
 <crate>/
@@ -64,7 +74,7 @@ All three crates share the same internal layout:
 └── docs/                  
 ```
 
-The three `src/` trees are deliberately near-identical: they differ only in the
+The four `src/` trees are deliberately near-identical: they differ only in the
 protocol-specific parts of `prover.rs`, `verifier.rs`, `inner_product_proof.rs`
 and `generators.rs`. Keeping them separate lets each protocol be built and
 measured in isolation, without feature flags cross-contaminating the timings.
@@ -103,12 +113,16 @@ cargo bench --bench pi2 --features yoloproofs,parallel
 cargo bench --bench pi3 --features yoloproofs,parallel
 
 # Pi_4
-cd ../pi4_dbl_mix_exp
+cd ../pi4_dec_mix
 cargo bench --bench pi4 --features yoloproofs,parallel
 
 # Pi_5
-cd ../pi5_dec_mix
+cd ../pi5_dbl_mix_exp
 cargo bench --bench pi5 --features yoloproofs,parallel
+
+# Pi_6
+cd pi6_dbl_mix_exp_single
+cargo bench --bench pi6 --features yoloproofs,parallel
 ```
 
 Drop `,parallel` from any command above for the single-threaded numbers.

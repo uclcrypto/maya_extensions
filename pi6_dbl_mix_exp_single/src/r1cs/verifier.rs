@@ -1,4 +1,3 @@
-#![allow(unused_imports, unused_variables)]
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 #[cfg(not(feature = "parallel"))]
@@ -210,8 +209,8 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         &mut self,
         z: &Scalar,
     ) -> (Vec<Scalar>, Vec<Scalar>, Vec<Scalar>, Vec<Scalar>, Scalar) {
-        let n = self.num_vars;
-        let m = self.num_inputs;
+        let n = self.num_vars; 
+        let m = self.num_inputs; 
 
         let mut wL = vec![Scalar::ZERO; n];
         let mut wR = vec![Scalar::ZERO; n];
@@ -246,7 +245,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         (wL, wR, wO, wV, wc)
     }
 
-    pub fn verify_pi5(
+    pub fn verify(
         mut self,
         proof: &R1CSProof,
         C1_prime: &[CompressedRistretto],
@@ -254,8 +253,12 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         c1_raw: &[CompressedRistretto],
         c2_raw: &[CompressedRistretto],
         e_challenge: &[Scalar],
-        h_rest: RistrettoPoint,
-        alpha_pub: CompressedRistretto,
+        D1_prime: Option<&[CompressedRistretto]>,
+        D2_prime: Option<&[CompressedRistretto]>,
+        d1_raw: Option<&[CompressedRistretto]>,
+        d2_raw: Option<&[CompressedRistretto]>,
+        alpha_pubs: Option<&[CompressedRistretto]>,
+        block_size: usize,
     ) -> Result<(), R1CSError> {
         use curve25519_dalek::traits::IsIdentity;
         use inner_product_proof::inner_product;
@@ -266,6 +269,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let _t_total = Instant::now();
         let _tp = Instant::now();
 
+        // 1. Checks & Padding
         let n = self.num_vars;
         let padded_n = self.num_inputs;
         let k_fold = proof.ipp_proof.k;
@@ -278,13 +282,16 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let gens = self.bp_gens.share(0);
 
         // 2. Transcript Interaction
+        // Commit Circuit Points
         self.transcript.commit_point(b"A_I", &proof.A_I);
         self.transcript.commit_point(b"A_O", &proof.A_O);
         self.transcript.commit_point(b"S", &proof.S);
 
+        // Get Challenges y, z
         let y = self.transcript.challenge_scalar(b"y");
         let z = self.transcript.challenge_scalar(b"z");
 
+        // Commit T Points
         self.transcript.commit_point(b"T_1", &proof.T_1);
         self.transcript.commit_point(b"T_3", &proof.T_3);
         self.transcript.commit_point(b"T_4", &proof.T_4);
@@ -294,36 +301,71 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
 
         let x = self.transcript.challenge_scalar(b"x");
 
+        // Commit Scalars
         self.transcript.commit_scalar(b"t_x", &proof.t_x);
-        self.transcript.commit_scalar(b"t_x_blinding", &proof.t_x_blinding);
-        self.transcript.commit_scalar(b"e_blinding", &proof.e_blinding);
+        self.transcript
+            .commit_scalar(b"t_x_blinding", &proof.t_x_blinding);
+        self.transcript
+            .commit_scalar(b"e_blinding", &proof.e_blinding);
 
         #[cfg(feature = "parallel")]
         let (mut wL, mut wR, mut wO, wV, wc) = self.flattened_constraints(&z);
         #[cfg(not(feature = "parallel"))]
         let (wL, wR, wO, wV, wc) = self.flattened_constraints(&z);
 
+        let dual_group_active = D1_prime.is_some() && D2_prime.is_some()
+            && d1_raw.is_some() && d2_raw.is_some();
+
+        // Per-voter anchors: one per block of size block_size
+        let k_original = C1_prime.len();
+        let num_anchors = if dual_group_active {
+            let kp = alpha_pubs.ok_or(R1CSError::VerificationError)?;
+            if block_size == 0 || k_original % block_size != 0 {
+                return Err(R1CSError::VerificationError);
+            }
+            let nb = k_original / block_size;
+            if kp.len() != nb || proof.S_Ks.len() != nb || proof.alpha_blindings.len() != nb {
+                return Err(R1CSError::VerificationError);
+            }
+            nb
+        } else {
+            0
+        };
+
         self.transcript.commit_point(b"S_prime", &proof.S_prime);
         self.transcript.commit_point(b"T_1_prime", &proof.T_1_prime);
         self.transcript.commit_point(b"S1_prime", &proof.S1_prime);
         self.transcript.commit_point(b"S2_prime", &proof.S2_prime);
-        self.transcript.commit_point(b"S_K", &proof.S_K);
+        if dual_group_active {
+            self.transcript.commit_point(b"S3_prime", &proof.S3_prime);
+            self.transcript.commit_point(b"S4_prime", &proof.S4_prime);
+            for S_K in &proof.S_Ks {
+                self.transcript.commit_point(b"S_K", S_K);
+            }
+        }
 
         let x_prime = self.transcript.challenge_scalar(b"x_prime");
 
         self.transcript.commit_scalar(b"tc_x", &proof.tc_x);
-        self.transcript.commit_scalar(b"tc_x_blinding", &proof.tc_x_blinding);
-        self.transcript.commit_scalar(b"ec_blinding", &proof.ec_blinding);
-        self.transcript.commit_scalar(b"r_blinding", &proof.r_blinding);
-        self.transcript.commit_scalar(b"alpha_blinding", &proof.alpha_blinding);
-
+        self.transcript
+            .commit_scalar(b"tc_x_blinding", &proof.tc_x_blinding);
+        self.transcript
+            .commit_scalar(b"ec_blinding", &proof.ec_blinding);
+        self.transcript
+            .commit_scalar(b"r_blinding", &proof.r_blinding);
+        if dual_group_active {
+            self.transcript.commit_scalar(b"r_blinding2", &proof.r_blinding2);
+            for ab in &proof.alpha_blindings {
+                self.transcript.commit_scalar(b"alpha_blinding", ab);
+            }
+        }
         self.transcript.commit_scalar(b"t_cross", &proof.t_cross);
         let t_cross = proof.t_cross;
 
         let x_ipp = self.transcript.challenge_scalar(b"x_ipp");
         let w_agg = self.transcript.challenge_scalar(b"w_agg");
 
-        // 3. Scalar and Point Reconstruction
+        // 3. Scalar & Point Reconstruction
         let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir) = proof
             .ipp_proof
             .verification_scalars(padded_n, self.transcript)
@@ -331,12 +373,13 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
 
         let mut U_points_decompressed_cir: Vec<RistrettoPoint> =
             Vec::with_capacity(proof.ipp_proof.U_vecs.len() * (2 * k_fold - 2));
-        for r_idx in 0..proof.ipp_proof.U_vecs.len() {
+
+        for r in 0..proof.ipp_proof.U_vecs.len() {
             for i_list in 0..(2 * k_fold - 2) {
-                let pt = proof.ipp_proof.U_vecs[r_idx][i_list]
+                let U_ir_point_cir = proof.ipp_proof.U_vecs[r][i_list]
                     .decompress()
                     .ok_or(R1CSError::VerificationError)?;
-                U_points_decompressed_cir.push(pt);
+                U_points_decompressed_cir.push(U_ir_point_cir);
             }
         }
 
@@ -461,7 +504,9 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let r2 = r * r;
 
         let T_scalars = [r * x, r * xx, rxx * x, rxx * xx, rxx * xxx, rxx * xx * xx];
-        let T_points = [proof.T_1, proof.T_2, proof.T_3, proof.T_4, proof.T_5, proof.T_6];
+        let T_points = [
+            proof.T_1, proof.T_2, proof.T_3, proof.T_4, proof.T_5, proof.T_6,
+        ];
 
         let expected_ip = proof.t_x + x_ipp * t_cross + x_ipp * x_ipp * proof.tc_x;
 
@@ -469,31 +514,56 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
             + r * (xx * (wc + delta) - proof.t_x)
             - r2 * proof.tc_x;
 
-        let B_blinding_scalar = x_ipp * proof.ec_blinding * s_P_cir
-            + proof.e_blinding * s_P_cir
+        let B_blinding_scalar = x_ipp * proof.ec_blinding * s_P_cir + proof.e_blinding * s_P_cir
             - r2 * proof.tc_x_blinding
             - r * proof.t_x_blinding;
 
         let r3 = r2 * r;
         let r4 = r3 * r;
-        let r5 = r4 * r;
+        let r5 = if dual_group_active { r4 * r } else { Scalar::ZERO };
 
-        let s_V_checkS          = r4 * (-s_P);
-        let s_S_prime_checkS    = r4 * x_prime * (-s_P);
-        let s_S1_prime          = r3 * x_prime * (-s_P);
-        let s_S2_prime          = r3 * chall_batched_ecp * x_prime * (-s_P);
-        let s_B_checkS          = s_P * r3 * proof.r_blinding;
-        let s_C0                = r3 * (-s_P);
-        let s_C1                = r3 * chall_batched_ecp * (-s_P);
+        // Per-anchor weights to batch-check the anchor equations
+        let omegas: Vec<Scalar> = if dual_group_active {
+            let t = self.transcript.challenge_scalar(b"anchor_batch");
+            let mut w = Vec::with_capacity(num_anchors);
+            let mut acc = r5;
+            for _ in 0..num_anchors {
+                w.push(acc);
+                acc *= t;
+            }
+            w
+        } else {
+            Vec::new()
+        };
+
+        let chall_sq = chall_batched_ecp * chall_batched_ecp;
+        let chall_cb = chall_sq * chall_batched_ecp;
+
+        let s_V_checkS = r4 * (-s_P);
+        let s_S_prime_checkS = r4 * x_prime * (-s_P);
+        let s_S1_prime = r3 * x_prime * (-s_P);
+        let s_S2_prime = r3 * chall_batched_ecp * x_prime * (-s_P);
+        let s_B_checkS = s_P * r3 * proof.r_blinding;
+        let s_C0 = r3 * (-s_P);
+        let s_C1 = r3 * chall_batched_ecp * (-s_P);
         let s_B_blinding_checkS = s_P * r4 * proof.ec_blinding;
-        let s_h_rest            = s_P * r3 * chall_batched_ecp * proof.r_blinding;
+        let s_F_checkS = s_P * r3 * chall_batched_ecp * proof.r_blinding;
 
-        let s_C1_agg = r3 * chall_batched_ecp * s_P * (-proof.alpha_blinding);
-        let s_B_eq6  = r5 * (-proof.alpha_blinding);
+        // Dual-group scalars (zero when single-group)
+        let s_S3_prime = if dual_group_active { r3 * chall_sq * x_prime * (-s_P) } else { Scalar::ZERO };
+        let s_S4_prime = if dual_group_active { r3 * chall_cb * x_prime * (-s_P) } else { Scalar::ZERO };
+        let s_A2_agg: Vec<Scalar> = proof.alpha_blindings.iter()
+            .map(|ab| r3 * chall_sq * s_P * ab).collect();
+        let s_B2_agg: Vec<Scalar> = proof.alpha_blindings.iter()
+            .map(|ab| r3 * chall_cb * s_P * ab).collect();
+        let s_F2_checkS = if dual_group_active { r3 * chall_cb * s_P * proof.r_blinding2 } else { Scalar::ZERO };
+        let s_B_grp2   = if dual_group_active { r3 * chall_sq * s_P * proof.r_blinding2 } else { Scalar::ZERO };
+        let s_B_eq6: Scalar = -omegas.iter().zip(proof.alpha_blindings.iter())
+            .map(|(w, ab)| w * ab).sum::<Scalar>();
 
-        let final_scalar_V          = (-x_ipp * s_P_cir) + s_V_checkS;
-        let final_scalar_S_prime    = (-x_ipp * s_P_cir * x_prime) + s_S_prime_checkS;
-        let final_scalar_B          = B_scalar + s_B_checkS + s_B_eq6;
+        let final_scalar_V = (-x_ipp * s_P_cir) + s_V_checkS;
+        let final_scalar_S_prime = (-x_ipp * s_P_cir * x_prime) + s_S_prime_checkS;
+        let final_scalar_B = B_scalar + s_B_checkS + s_B_grp2 + s_B_eq6;
         let final_scalar_B_blinding = B_blinding_scalar + s_B_blinding_checkS;
 
         #[cfg(feature = "parallel")]
@@ -510,16 +580,50 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
             .collect();
 
         // 5. Final MSM Construction
-        let k_original = C1_prime.len();
+        let anchor_scalars: Vec<Scalar> = omegas.iter().map(|w| w * x_prime)
+            .chain(omegas.iter().map(|w| -w))
+            .collect();
 
-        let pi5_scalars = vec![
-            r5 * x_prime,
-            r5 * (-Scalar::ONE),
-        ];
+        let dual_rest_scalars: Vec<Scalar> = if dual_group_active {
+            vec![s_S3_prime, s_S4_prime, s_F2_checkS].into_iter()
+                .chain(anchor_scalars.iter().cloned())
+                .collect()
+        } else {
+            vec![]
+        };
+        #[cfg(feature = "parallel")]
+        let dual_cipher_scalars: Vec<Scalar> = if dual_group_active {
+            let ((a2_sc, b2_sc), (c1p_sc, c2p_sc)) = rayon::join(
+                || rayon::join(
+                    || e_challenge[0..k_original].par_iter().enumerate().map(|(i, ei)| *ei * s_A2_agg[i / block_size]).collect::<Vec<_>>(),
+                    || e_challenge[0..k_original].par_iter().enumerate().map(|(i, ei)| *ei * s_B2_agg[i / block_size]).collect::<Vec<_>>(),
+                ),
+                || rayon::join(
+                    || z_s_vec[0..k_original].par_iter().map(|z| z * r3 * chall_sq).collect::<Vec<_>>(),
+                    || z_s_vec[0..k_original].par_iter().map(|z| z * r3 * chall_cb).collect::<Vec<_>>(),
+                ),
+            );
+            a2_sc.into_iter().chain(b2_sc).chain(c1p_sc).chain(c2p_sc).collect()
+        } else {
+            vec![]
+        };
+        #[cfg(not(feature = "parallel"))]
+        let dual_cipher_scalars: Vec<Scalar> = if dual_group_active {
+            let mut v = Vec::with_capacity(4 * k_original);
+            v.extend(e_challenge[0..k_original].iter().enumerate().map(|(i, ei)| *ei * s_A2_agg[i / block_size]));
+            v.extend(e_challenge[0..k_original].iter().enumerate().map(|(i, ei)| *ei * s_B2_agg[i / block_size]));
+            v.extend(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_sq));
+            v.extend(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_cb));
+            v
+        } else {
+            vec![]
+        };
 
         if _do_print {
-            eprintln!("  [Verif-A] Transcript + Scalars: {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [Verif-A] Transcript + Scalars: {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
         let _tp = Instant::now();
 
@@ -528,7 +632,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let mega_check = {
             let ((c1_sc, c2_sc), (c1p_sc, c2p_sc)) = rayon::join(
                 || rayon::join(
-                    || e_challenge[0..k_original].par_iter().map(|ei| *ei * (s_C0 + s_C1_agg)).collect::<Vec<_>>(),
+                    || e_challenge[0..k_original].par_iter().map(|ei| *ei * s_C0).collect::<Vec<_>>(),
                     || e_challenge[0..k_original].par_iter().map(|ei| *ei * s_C1).collect::<Vec<_>>(),
                 ),
                 || rayon::join(
@@ -538,11 +642,16 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
             );
             let cipher_scalars: Vec<Scalar> = c1_sc.into_iter()
                 .chain(c2_sc).chain(c1p_sc).chain(c2p_sc)
+                .chain(dual_cipher_scalars.into_iter())
                 .collect();
 
             let cipher_points: Vec<CompressedRistretto> = c1_raw[0..k_original].iter()
                 .chain(c2_raw[0..k_original].iter())
                 .chain(C1_prime.iter()).chain(C2_prime.iter())
+                .chain(if dual_group_active { d1_raw.unwrap() } else { &[] }.iter())
+                .chain(if dual_group_active { d2_raw.unwrap() } else { &[] }.iter())
+                .chain(if dual_group_active { D1_prime.unwrap() } else { &[] }.iter())
+                .chain(if dual_group_active { D2_prime.unwrap() } else { &[] }.iter())
                 .cloned().collect();
 
             let rest_scalars: Vec<Scalar> = iter::once(-x * s_P_cir)
@@ -552,7 +661,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(iter::once(final_scalar_S_prime))
                 .chain(iter::once(final_scalar_B))
                 .chain(iter::once(final_scalar_B_blinding))
-                .chain(iter::once(s_h_rest))
+                .chain(iter::once(s_F_checkS))
                 .chain(final_g_scalars.into_iter())
                 .chain(h_scalars.into_iter())
                 .chain(s_U_cir.iter().map(|s| -s))
@@ -561,12 +670,29 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(T_scalars.iter().cloned())
                 .chain(iter::once(s_S1_prime))
                 .chain(iter::once(s_S2_prime))
-                .chain(pi5_scalars.into_iter())
+                .chain(dual_rest_scalars.into_iter())
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r4))
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r3))
                 .collect();
 
             let _tp_b = Instant::now();
+
+            let dual_rest_points: Vec<RistrettoPoint> = if dual_group_active {
+                let mut v = vec![
+                    proof.S3_prime.decompress().ok_or(R1CSError::VerificationError)?,
+                    proof.S4_prime.decompress().ok_or(R1CSError::VerificationError)?,
+                    self.pc_gens.F2,
+                ];
+                for S_K in &proof.S_Ks {
+                    v.push(S_K.decompress().ok_or(R1CSError::VerificationError)?);
+                }
+                for K in alpha_pubs.unwrap() {
+                    v.push(K.decompress().ok_or(R1CSError::VerificationError)?);
+                }
+                v
+            } else {
+                vec![]
+            };
 
             let pt_AI  = proof.A_I.decompress().ok_or(R1CSError::VerificationError)?;
             let pt_AO  = proof.A_O.decompress().ok_or(R1CSError::VerificationError)?;
@@ -581,8 +707,6 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .collect::<Result<Vec<_>, _>>()?;
             let pt_S1p = proof.S1_prime.decompress().ok_or(R1CSError::VerificationError)?;
             let pt_S2p = proof.S2_prime.decompress().ok_or(R1CSError::VerificationError)?;
-            let pt_SK  = proof.S_K.decompress().ok_or(R1CSError::VerificationError)?;
-            let pt_alpha = alpha_pub.decompress().ok_or(R1CSError::VerificationError)?;
             let pt_ecp_A0: Vec<RistrettoPoint> = proof.ecp_batched.A_vecs.iter().flatten()
                 .map(|A| A[0].decompress().ok_or(R1CSError::VerificationError))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -597,7 +721,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(iter::once(pt_Sp))
                 .chain(iter::once(self.pc_gens.B))
                 .chain(iter::once(self.pc_gens.B_blinding))
-                .chain(iter::once(h_rest))   
+                .chain(iter::once(self.pc_gens.F))
                 .chain(gens.G(padded_n).cloned())
                 .chain(gens.H(padded_n).cloned())
                 .chain(U_points_decompressed_cir.into_iter())
@@ -606,8 +730,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(pt_T.into_iter())
                 .chain(iter::once(pt_S1p))
                 .chain(iter::once(pt_S2p))
-                .chain(iter::once(pt_SK))
-                .chain(iter::once(pt_alpha))
+                .chain(dual_rest_points.into_iter())
                 .chain(pt_ecp_A0.into_iter())
                 .chain(pt_ecp_A1.into_iter())
                 .collect();
@@ -651,6 +774,18 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
 
         #[cfg(not(feature = "parallel"))]
         let mega_check = {
+            let dual_scalars: Vec<Scalar> = if dual_group_active {
+                let mut v = vec![s_S3_prime, s_S4_prime, s_F2_checkS];
+                v.extend(e_challenge[0..k_original].iter().enumerate().map(|(i, ei)| *ei * s_A2_agg[i / block_size]));
+                v.extend(e_challenge[0..k_original].iter().enumerate().map(|(i, ei)| *ei * s_B2_agg[i / block_size]));
+                v.extend(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_sq));
+                v.extend(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_cb));
+                v.extend(anchor_scalars.iter().cloned());
+                v
+            } else {
+                vec![]
+            };
+
             let combined_scalars: Vec<Scalar> = iter::once(-x * s_P_cir)
                 .chain(iter::once(-x * x * s_P_cir))
                 .chain(iter::once(-x * x * x * s_P_cir))
@@ -658,7 +793,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(iter::once(final_scalar_S_prime))
                 .chain(iter::once(final_scalar_B))
                 .chain(iter::once(final_scalar_B_blinding))
-                .chain(iter::once(s_h_rest))
+                .chain(iter::once(s_F_checkS))
                 .chain(final_g_scalars.into_iter())
                 .chain(h_scalars.into_iter())
                 .chain(s_U_cir.iter().map(|s| -s))
@@ -667,19 +802,35 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(T_scalars.iter().cloned())
                 .chain(iter::once(s_S1_prime))
                 .chain(iter::once(s_S2_prime))
-                .chain(e_challenge[0..k_original].iter().map(|ei| *ei * (s_C0 + s_C1_agg)))
+                .chain(e_challenge[0..k_original].iter().map(|ei| *ei * s_C0))
                 .chain(e_challenge[0..k_original].iter().map(|ei| *ei * s_C1))
                 .chain(z_s_vec[0..k_original].iter().map(|z| z * r3))
                 .chain(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_batched_ecp))
-                .chain(pi5_scalars.into_iter())
+                .chain(dual_scalars.into_iter())
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r4))
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r3))
                 .collect();
 
-            let pi5_points: Vec<Option<RistrettoPoint>> = vec![
-                proof.S_K.decompress(),
-                alpha_pub.decompress(),
-            ];
+            let dual_points: Vec<Option<RistrettoPoint>> = if dual_group_active {
+                let d1 = D1_prime.unwrap();
+                let d2 = D2_prime.unwrap();
+                let dr1 = d1_raw.unwrap();
+                let dr2 = d2_raw.unwrap();
+                let mut v: Vec<Option<RistrettoPoint>> = vec![
+                    proof.S3_prime.decompress(),
+                    proof.S4_prime.decompress(),
+                    Some(self.pc_gens.F2),
+                ];
+                v.extend(dr1.iter().map(|p| p.decompress()));
+                v.extend(dr2.iter().map(|p| p.decompress()));
+                v.extend(d1.iter().map(|p| p.decompress()));
+                v.extend(d2.iter().map(|p| p.decompress()));
+                v.extend(proof.S_Ks.iter().map(|p| p.decompress()));
+                v.extend(alpha_pubs.unwrap().iter().map(|p| p.decompress()));
+                v
+            } else {
+                vec![]
+            };
 
             let ecp_a0: Vec<Option<RistrettoPoint>> = proof.ecp_batched.A_vecs
                 .iter().flatten().map(|A| A[0].decompress()).collect();
@@ -693,7 +844,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(iter::once(proof.S_prime.decompress()))
                 .chain(iter::once(Some(self.pc_gens.B)))
                 .chain(iter::once(Some(self.pc_gens.B_blinding)))
-                .chain(iter::once(Some(h_rest)))   
+                .chain(iter::once(Some(self.pc_gens.F)))
                 .chain(gens.G(padded_n).cloned().map(Some))
                 .chain(gens.H(padded_n).cloned().map(Some))
                 .chain(U_points_decompressed_cir.into_iter().map(Some))
@@ -706,7 +857,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(c2_raw[0..k_original].iter().map(|p| p.decompress()))
                 .chain(C1_prime.iter().map(|c| c.decompress()))
                 .chain(C2_prime.iter().map(|c| c.decompress()))
-                .chain(pi5_points.into_iter())
+                .chain(dual_points.into_iter())
                 .chain(ecp_a0.into_iter())
                 .chain(ecp_a1.into_iter());
 
@@ -714,8 +865,10 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .ok_or(R1CSError::VerificationError)?;
 
             if _do_print {
-                eprintln!("  [Verif-TOTAL]:                  {:>7.1} ms",
-                    _t_total.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  [Verif-TOTAL]:                  {:>7.1} ms",
+                    _t_total.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             result

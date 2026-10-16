@@ -1,7 +1,7 @@
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 #[allow(unused_imports)]
-use curve25519_dalek::traits::{MultiscalarMul, VartimeMultiscalarMul};
+use curve25519_dalek::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
 use hmac_transcript::HmacTranscript;
 use zeroize::Zeroize;
 
@@ -299,16 +299,21 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             .sum()
     }
 
-    pub fn prove_pi5(
+    pub fn prove(
         mut self,
         C1_prime: &[RistrettoPoint],
         C2_prime: &[RistrettoPoint],
         r_prime: Scalar,
         k_fold: usize,
         num_rounds: usize,
-        h_rest: RistrettoPoint,
-        C1_agg: RistrettoPoint,
-        alpha: Scalar,
+        D1_prime: Option<&[RistrettoPoint]>,
+        D2_prime: Option<&[RistrettoPoint]>,
+        r_prime2: Option<Scalar>,
+        alphas: Option<&[Scalar]>,
+        D1_raw: Option<&[RistrettoPoint]>,
+        D2_raw: Option<&[RistrettoPoint]>,
+        e_challenge: Option<&[Scalar]>,
+        block_size: usize,
     ) -> Result<R1CSProof, R1CSError> {
         use inner_product_proof::inner_product;
         use rand::thread_rng;
@@ -324,8 +329,7 @@ impl<'a, 'b> ProverCS<'a, 'b> {
 
         let gens = self.bp_gens.share(0);
 
-        let _do_print =  std::env::var("VERBOSE").ok().filter(|v| v == "1" || v.eq_ignore_ascii_case("true")).is_some() && !PROVER_TIMING_PRINTED.swap(true, Ordering::SeqCst);
-
+        let _do_print = std::env::var("VERBOSE").ok().filter(|v| v == "1" || v.eq_ignore_ascii_case("true")).is_some()&& !PROVER_TIMING_PRINTED.swap(true, Ordering::SeqCst);
         let _t_total = Instant::now();
 
         // 0. Transcript & RNG
@@ -335,16 +339,13 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             use rand_chacha::ChaCha20Rng;
             use rand::SeedableRng;
 
-            //Step 1: The Deterministic Seed = H(state,"witness_rng"∣∣0x00∣∣self.v_blinding)
             let witness_seed = self.transcript.witness_rng_seed(self.v_blinding.as_bytes());
             let mut os_bytes = [0u8; 32];
 
-            //Step 2: The Fresh OS Entropy
             if std::env::var("MAYA_DETERMINISTIC").ok().as_deref() != Some("1") {
                 thread_rng().fill_bytes(&mut os_bytes);
             }
 
-            //Step 3: The Combination (XOR)
             let mut seed = [0u8; 32];
             for i in 0..32 {
                 seed[i] = witness_seed[i] ^ os_bytes[i];
@@ -359,10 +360,10 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         }
 
         // 1. Circuit Commitment
-        let _tp = Instant::now();
-        let mut i_blinding = Scalar::random(&mut rng);
-        let mut o_blinding = Scalar::random(&mut rng);
-        let mut s_blinding = Scalar::random(&mut rng);
+        let _tp = Instant::now();  
+        let i_blinding = Scalar::random(&mut rng);
+        let o_blinding = Scalar::random(&mut rng);
+        let s_blinding = Scalar::random(&mut rng);
 
         let mut s_L = Vec::with_capacity(n);
         let mut s_R = Vec::with_capacity(n);
@@ -377,29 +378,43 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             let a_R = &self.a_R;
             let a_O = &self.a_O;
             let b_blind = self.pc_gens.B_blinding;
-
-            
-            let gh_pts: Vec<RistrettoPoint> = iter::once(b_blind)
-                .chain(gens.G(n).copied())
-                .chain(gens.H(n).copied())
-                .collect(); 
-
+            let g_pts: Vec<RistrettoPoint> = gens.G(n).cloned().collect();
+            let h_pts: Vec<RistrettoPoint> = gens.H(n).cloned().collect();
             let ((a_i, a_o), s) = rayon::join(
                 || {
                     rayon::join(
                         || {
-                            let scalars: Vec<Scalar> = iter::once(i_blinding).chain(a_L.iter().copied()).chain(a_R.iter().copied()).collect();
-                            chunked_vartime_multiscalar_mul(&scalars, &gh_pts).compress()
+                            let scalars: Vec<Scalar> = iter::once(i_blinding)
+                                .chain(a_L.iter().copied())
+                                .chain(a_R.iter().copied())
+                                .collect();
+                            let points: Vec<RistrettoPoint> = iter::once(b_blind)
+                                .chain(g_pts.iter().copied())
+                                .chain(h_pts.iter().copied())
+                                .collect();
+                            crate::util_msm::chunked_vartime_multiscalar_mul(&scalars, &points).compress()
                         },
                         || {
-                            let scalars: Vec<Scalar> = iter::once(o_blinding).chain(a_O.iter().copied()).collect();
-                            chunked_vartime_multiscalar_mul(&scalars, &gh_pts[0..n+1]).compress()
+                            let scalars: Vec<Scalar> = iter::once(o_blinding)
+                                .chain(a_O.iter().copied())
+                                .collect();
+                            let points: Vec<RistrettoPoint> = iter::once(b_blind)
+                                .chain(g_pts.iter().copied())
+                                .collect();
+                            crate::util_msm::chunked_vartime_multiscalar_mul(&scalars, &points).compress()
                         },
                     )
                 },
                 || {
-                    let scalars: Vec<Scalar> = iter::once(s_blinding).chain(s_L.iter().copied()).chain(s_R.iter().copied()).collect();
-                    chunked_vartime_multiscalar_mul(&scalars, &gh_pts).compress()
+                    let scalars: Vec<Scalar> = iter::once(s_blinding)
+                        .chain(s_L.iter().copied())
+                        .chain(s_R.iter().copied())
+                        .collect();
+                    let points: Vec<RistrettoPoint> = iter::once(b_blind)
+                        .chain(g_pts.iter().copied())
+                        .chain(h_pts.iter().copied())
+                        .collect();
+                    crate::util_msm::chunked_vartime_multiscalar_mul(&scalars, &points).compress()
                 },
             );
             (a_i, a_o, s)
@@ -434,8 +449,10 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         self.transcript.commit_point(b"A_O", &A_O);
         self.transcript.commit_point(b"S", &S);
         if _do_print {
-            eprintln!("  [1] Circuit commitment (A_I,A_O,S):      {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [1] Circuit commitment (A_I,A_O,S):      {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // 2. Polynomials
@@ -481,6 +498,7 @@ impl<'a, 'b> ProverCS<'a, 'b> {
                 l_poly.1[i] = self.a_L[i] + exp_y_inv[i] * wR[i];
                 l_poly.2[i] = self.a_O[i];
                 l_poly.3[i] = s_L[i];
+
                 r_poly.0[i] = wO[i] - exp_y_vec[i];
                 r_poly.1[i] = exp_y_vec[i] * self.a_R[i] + wL[i];
                 r_poly.3[i] = exp_y_vec[i] * s_R[i];
@@ -489,21 +507,22 @@ impl<'a, 'b> ProverCS<'a, 'b> {
 
         let t_poly = util::VecPoly3::special_inner_product(&l_poly, &r_poly);
         if _do_print {
-            eprintln!("  [2] Polynomial construction (l,r,t):     {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [2] Polynomial construction (l,r,t):     {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
-        // 3. T Commitments
-        let _tp = Instant::now();
-        let mut t_blindings = [
+        let _tp = Instant::now(); 
+        let t_blindings = [
+            Scalar::random(&mut rng), 
+            Scalar::random(&mut rng), 
             Scalar::random(&mut rng),
-            Scalar::random(&mut rng),
-            Scalar::random(&mut rng),
-            Scalar::random(&mut rng),
-            Scalar::random(&mut rng),
+            Scalar::random(&mut rng), 
+            Scalar::random(&mut rng), 
         ];
 
-        let mut t_2_blinding = Scalar::random(&mut rng);
+        let t_2_blinding = Scalar::random(&mut rng);
         let t_2: Scalar = wV.iter().zip(self.v.iter()).map(|(c, v)| c * v).sum();
 
         #[cfg(feature = "parallel")]
@@ -512,20 +531,26 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             let (((t1, t3), (t4, t5)), (t6, t2_commit)) = rayon::join(
                 || {
                     rayon::join(
-                        || rayon::join(
-                            || pc.commit(t_poly.t1, t_blindings[0]).compress(),
-                            || pc.commit(t_poly.t3, t_blindings[1]).compress(),
-                        ),
-                        || rayon::join(
-                            || pc.commit(t_poly.t4, t_blindings[2]).compress(),
-                            || pc.commit(t_poly.t5, t_blindings[3]).compress(),
-                        ),
+                        || {
+                            rayon::join(
+                                || pc.commit(t_poly.t1, t_blindings[0]).compress(),
+                                || pc.commit(t_poly.t3, t_blindings[1]).compress(),
+                            )
+                        },
+                        || {
+                            rayon::join(
+                                || pc.commit(t_poly.t4, t_blindings[2]).compress(),
+                                || pc.commit(t_poly.t5, t_blindings[3]).compress(),
+                            )
+                        },
                     )
                 },
-                || rayon::join(
-                    || pc.commit(t_poly.t6, t_blindings[4]).compress(),
-                    || pc.commit(t_2, t_2_blinding).compress(),
-                ),
+                || {
+                    rayon::join(
+                        || pc.commit(t_poly.t6, t_blindings[4]).compress(),
+                        || pc.commit(t_2, t_2_blinding).compress(),
+                    )
+                },
             );
             (t1, t2_commit, t3, t4, t5, t6)
         };
@@ -547,8 +572,10 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         self.transcript.commit_point(b"T_6", &T_6);
         self.transcript.commit_point(b"T_2", &T_2);
         if _do_print {
-            eprintln!("  [3] T commitments (T_1..T_6):            {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [3] T commitments (T_1..T_6):   {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         let _tp = Instant::now();
@@ -578,32 +605,33 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         let e_blinding = x * (i_blinding + x * (o_blinding + x * s_blinding));
 
         self.transcript.commit_scalar(b"t_x", &t_x);
-        self.transcript.commit_scalar(b"t_x_blinding", &t_x_blinding);
+        self.transcript
+            .commit_scalar(b"t_x_blinding", &t_x_blinding);
         self.transcript.commit_scalar(b"e_blinding", &e_blinding);
         if _do_print {
-            eprintln!("  [3.1] t_x, e_blinding, t_x_blinding:    {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [3.1] T commitments (t_x, e_blinding, t_x_blinding):   {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // 4. Consistency Setup
         let _tp = Instant::now();
-        let mut s_bl_prime = Scalar::random(&mut rng);
-        let mut rnd = Scalar::random(&mut rng);
+        let s_bl_prime = Scalar::random(&mut rng);
+        let rnd = Scalar::random(&mut rng);
         let k_original = C1_prime.len();
 
         let mut s_L_prime = Vec::with_capacity(k);
+
         for _ in 0..k_original {
             s_L_prime.push(Scalar::random(&mut rng));
         }
 
-        let mut beta = Scalar::random(&mut rng);
-        let neg_beta = -beta;
-
-  
         #[cfg(feature = "parallel")]
         let (S_prime, S1_prime, S2_prime) = {
             let b_blinding = self.pc_gens.B_blinding;
             let b_pt = self.pc_gens.B;
+            let f_pt = self.pc_gens.F;
             let g_pts: Vec<RistrettoPoint> = gens.G(k_original).cloned().collect();
             let sl = &s_L_prime[0..k_original];
 
@@ -615,14 +643,8 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             let s1_points: Vec<RistrettoPoint> = iter::once(b_pt).chain(C1_prime.iter().copied()).collect();
             let s1_pr = crate::util_msm::chunked_vartime_multiscalar_mul(&s1_scalars, &s1_points).compress();
 
-            let s2_scalars: Vec<Scalar> = iter::once(rnd)
-                .chain(sl.iter().copied())
-                .chain(iter::once(neg_beta))
-                .collect();
-            let s2_points: Vec<RistrettoPoint> = iter::once(h_rest)
-                .chain(C2_prime.iter().copied())
-                .chain(iter::once(C1_agg))
-                .collect();
+            let s2_scalars: Vec<Scalar> = iter::once(rnd).chain(sl.iter().copied()).collect();
+            let s2_points: Vec<RistrettoPoint> = iter::once(f_pt).chain(C2_prime.iter().copied()).collect();
             let s2_pr = crate::util_msm::chunked_vartime_multiscalar_mul(&s2_scalars, &s2_points).compress();
 
             (s_pr, s1_pr, s2_pr)
@@ -640,23 +662,101 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             )
             .compress();
             let s2_pr = RistrettoPoint::vartime_multiscalar_mul(
-                iter::once(&rnd)
-                    .chain(s_L_prime[0..k_original].iter())
-                    .chain(iter::once(&neg_beta)),
-                iter::once(&h_rest)
-                    .chain(C2_prime.iter())
-                    .chain(iter::once(&C1_agg)),
+                iter::once(&rnd).chain(s_L_prime[0..k_original].iter()),
+                iter::once(&self.pc_gens.F).chain(C2_prime.iter()),
             )
             .compress();
             (s_pr, s1_pr, s2_pr)
         };
 
-        // S_K = g^beta
-        let S_K = (self.pc_gens.B * beta).compress();
         if _do_print {
-            eprintln!("  [4] Consistency setup (S',S1',S2',S_K):  {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [4] Consistency setup (S',S1',S2'):   {:>8.3} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
+
+        // Dual-group consistency commitments (per-voter alpha: one alpha_beta per block).
+          let dual_group_active = D1_prime.is_some() && D2_prime.is_some()
+            && r_prime2.is_some() && alphas.is_some()
+            && D1_raw.is_some() && D2_raw.is_some() && e_challenge.is_some();
+
+        let mut y2   = Scalar::ZERO;
+        let mut betas: Vec<Scalar> = Vec::new();
+        let (S3_prime, S4_prime) = if dual_group_active {
+            let d1 = D1_prime.unwrap();
+            let d2 = D2_prime.unwrap();
+            let dr1 = D1_raw.unwrap();
+            let dr2 = D2_raw.unwrap();
+            let e = &e_challenge.unwrap()[0..k_original];
+            let num_anchors = alphas.unwrap().len();
+            if block_size == 0 || num_anchors * block_size != k_original
+                || dr1.len() != k_original || dr2.len() != k_original
+            {
+                return Err(R1CSError::InputLengthError);
+            }
+            y2   = Scalar::random(&mut rng);
+            betas = (0..num_anchors).map(|_| Scalar::random(&mut rng)).collect();
+            let sl = &s_L_prime[0..k_original];
+
+            #[cfg(feature = "parallel")]
+            let e_beta: Vec<Scalar> = e.par_iter().enumerate()
+                .map(|(i, ei)| ei * betas[i / block_size]).collect();
+            #[cfg(not(feature = "parallel"))]
+            let e_beta: Vec<Scalar> = e.iter().enumerate()
+                .map(|(i, ei)| ei * betas[i / block_size]).collect();
+
+            #[cfg(feature = "parallel")]
+            let (s3, s4) = rayon::join(
+                || {
+                    let s3_scalars: Vec<Scalar> = sl.iter().copied()
+                        .chain(iter::once(y2))
+                        .chain(e_beta.iter().copied())
+                        .collect();
+                    let s3_points: Vec<RistrettoPoint> = d1.iter().copied()
+                        .chain(iter::once(self.pc_gens.B))
+                        .chain(dr1.iter().copied())
+                        .collect();
+                    crate::util_msm::chunked_vartime_multiscalar_mul(&s3_scalars, &s3_points).compress()
+                },
+                || {
+                    let s4_scalars: Vec<Scalar> = sl.iter().copied()
+                        .chain(iter::once(y2))
+                        .chain(e_beta.iter().copied())
+                        .collect();
+                    let s4_points: Vec<RistrettoPoint> = d2.iter().copied()
+                        .chain(iter::once(self.pc_gens.F2))
+                        .chain(dr2.iter().copied())
+                        .collect();
+                    crate::util_msm::chunked_vartime_multiscalar_mul(&s4_scalars, &s4_points).compress()
+                }
+            );
+
+            #[cfg(not(feature = "parallel"))]
+            let (s3, s4) = {
+                let s3_res = RistrettoPoint::vartime_multiscalar_mul(
+                    sl.iter().chain(iter::once(&y2)).chain(e_beta.iter()),
+                    d1.iter().chain(iter::once(&self.pc_gens.B)).chain(dr1.iter()),
+                ).compress();
+                let s4_res = RistrettoPoint::vartime_multiscalar_mul(
+                    sl.iter().chain(iter::once(&y2)).chain(e_beta.iter()),
+                    d2.iter().chain(iter::once(&self.pc_gens.F2)).chain(dr2.iter()),
+                ).compress();
+                (s3_res, s4_res)
+            };
+
+            (s3, s4)
+        } else {
+            (
+                curve25519_dalek::ristretto::RistrettoPoint::identity().compress(),
+                curve25519_dalek::ristretto::RistrettoPoint::identity().compress(),
+            )
+        };
+
+
+        let S_Ks: Vec<CompressedRistretto> = betas.iter()
+            .map(|b| (self.pc_gens.B * b).compress())
+            .collect();
 
         let _tp = Instant::now();
         let mut lc_poly = util::VecPoly1::zero(k);
@@ -672,7 +772,7 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         }
 
         let tc_poly = lc_poly.inner_product(&rc_poly);
-        let mut t1_bl_prime = Scalar::random(&mut rng);
+        let t1_bl_prime = Scalar::random(&mut rng);
         let T_1_prime = self.pc_gens.commit(tc_poly.1, t1_bl_prime).compress();
         let tc_bl_poly = util::Poly2(t_2_blinding, t1_bl_prime, Scalar::ZERO);
 
@@ -680,7 +780,13 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         self.transcript.commit_point(b"T_1_prime", &T_1_prime);
         self.transcript.commit_point(b"S1_prime", &S1_prime);
         self.transcript.commit_point(b"S2_prime", &S2_prime);
-        self.transcript.commit_point(b"S_K", &S_K);
+        if dual_group_active {
+            self.transcript.commit_point(b"S3_prime", &S3_prime);
+            self.transcript.commit_point(b"S4_prime", &S4_prime);
+            for S_K in &S_Ks {
+                self.transcript.commit_point(b"S_K", S_K);
+            }
+        }
 
         let x_prime = self.transcript.challenge_scalar(b"x_prime");
 
@@ -689,22 +795,40 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         let ec_blinding = self.v_blinding + s_bl_prime * x_prime;
         let r_blinding = r_prime + rnd * x_prime;
 
-        let alpha_blinding = beta * x_prime - alpha;
+        // Dual-group responses
+        let (r_blinding2, alpha_blindings) = if dual_group_active {
+            let rb2 = r_prime2.unwrap() + y2 * x_prime;
+            let ab: Vec<Scalar> = betas.iter().zip(alphas.unwrap().iter())
+                .map(|(b, a)| b * x_prime - a)
+                .collect();
+            (rb2, ab)
+        } else {
+            (Scalar::ZERO, Vec::new())
+        };
 
         self.transcript.commit_scalar(b"tc_x", &tc_x);
-        self.transcript.commit_scalar(b"tc_x_blinding", &tc_x_blinding);
+        self.transcript
+            .commit_scalar(b"tc_x_blinding", &tc_x_blinding);
         self.transcript.commit_scalar(b"ec_blinding", &ec_blinding);
         self.transcript.commit_scalar(b"r_blinding", &r_blinding);
-        self.transcript.commit_scalar(b"alpha_blinding", &alpha_blinding);
+        if dual_group_active {
+            self.transcript.commit_scalar(b"r_blinding2", &r_blinding2);
+            for ab in &alpha_blindings {
+                self.transcript.commit_scalar(b"alpha_blinding", ab);
+            }
+        }
 
         let lc_vec = lc_poly.eval(x_prime);
         let rc_vec = rc_poly.eval(x_prime);
         if _do_print {
-            eprintln!("  [4.1] Consistency setup (responses):     {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [4.1] Consistency setup (responses):   {:>8.3} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
-        // 5. Aggregation Protocol
+        // 5. Aggregation Protocol 
+
         let t_cross = inner_product(&l_vec[0..k], &rc_vec) + inner_product(&lc_vec, &r_vec[0..k]);
 
         self.transcript.commit_scalar(b"t_cross", &t_cross);
@@ -724,7 +848,9 @@ impl<'a, 'b> ProverCS<'a, 'b> {
         #[cfg(feature = "parallel")]
         let H_prime: Vec<RistrettoPoint> = {
             let h_vec: Vec<RistrettoPoint> = gens.H(k).cloned().collect();
-            h_vec.par_iter().zip(exp_y_inv.par_iter())
+            h_vec
+                .par_iter()
+                .zip(exp_y_inv.par_iter())
                 .map(|(H_i, exp_i)| H_i * exp_i)
                 .collect()
         };
@@ -736,11 +862,13 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             .collect();
 
         if _do_print {
-            eprintln!("  [5] Aggregation (H'):                    {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [5] Aggregation (H'):     {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
-
         let _tp = Instant::now();
+
         let ipp_proof = prove_ipa::create(
             self.transcript,
             k_fold,
@@ -752,15 +880,38 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             num_rounds,
         );
         if _do_print {
-            eprintln!("  [6] IPA proof (prove_ipa):               {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [6] IPA proof (prove_ipa):           {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // 6. Batched ECP Protocol
         let _tp = Instant::now();
         let chall_batched_ecp = self.transcript.challenge_scalar(b"chall_batched_ecp");
 
-        let C_agg: Vec<RistrettoPoint> = {
+        let C_agg: Vec<RistrettoPoint> = if dual_group_active {
+            let d1 = D1_prime.unwrap();
+            let d2 = D2_prime.unwrap();
+            let chall_sq = chall_batched_ecp * chall_batched_ecp;
+            let chall_cb = chall_sq * chall_batched_ecp;
+            #[cfg(feature = "parallel")]
+            {
+                C1_prime.par_iter().zip(C2_prime.par_iter()).zip(d1.par_iter()).zip(d2.par_iter())
+                    .map(|(((c1, c2), d1i), d2i)| RistrettoPoint::vartime_multiscalar_mul(
+                        &[Scalar::ONE, chall_batched_ecp, chall_sq, chall_cb],
+                        &[*c1, *c2, *d1i, *d2i]))
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                C1_prime.iter().zip(C2_prime.iter()).zip(d1.iter()).zip(d2.iter())
+                    .map(|(((c1, c2), d1i), d2i)| RistrettoPoint::vartime_multiscalar_mul(
+                        &[Scalar::ONE, chall_batched_ecp, chall_sq, chall_cb],
+                        &[*c1, *c2, *d1i, *d2i]))
+                    .collect()
+            }
+        } else {
             #[cfg(feature = "parallel")]
             {
                 C1_prime.par_iter().zip(C2_prime.par_iter())
@@ -776,8 +927,10 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             }
         };
         if _do_print {
-            eprintln!("  [7] C_agg construction:                  {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [7] (C_agg):    {:>8.3} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         let _tp = Instant::now();
@@ -790,39 +943,61 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             num_rounds,
         );
         if _do_print {
-            eprintln!("  [8] eCP proof (prove_ecp::create):       {:>7.1} ms",
-                _tp.elapsed().as_secs_f64() * 1000.0);
-            eprintln!("  [TOTAL prover prove_pi5()]:              {:>7.1} ms",
-                _t_total.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "  [8] eCP proof (prove_ecp::create):                   {:>7.1} ms",
+                _tp.elapsed().as_secs_f64() * 1000.0
+            );
+            eprintln!(
+                "  [TOTAL prover prove()]:                  {:>7.1} ms",
+                _t_total.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
-        // 7. Cleanup 
-        for e in s_L.iter_mut() { e.zeroize(); }
-        for e in s_R.iter_mut() { e.zeroize(); }
-        for e in s_L_prime.iter_mut() { e.zeroize(); }
-        beta.zeroize();
-        i_blinding.zeroize();
-        o_blinding.zeroize();
-        s_blinding.zeroize();
-        for tb in t_blindings.iter_mut() { tb.zeroize(); }
-        t_2_blinding.zeroize();
-        t1_bl_prime.zeroize();
-        s_bl_prime.zeroize();
-        rnd.zeroize();
-        for l in l_agg.iter_mut() { l.zeroize(); }
-        for r in r_agg.iter_mut() { r.zeroize(); }
+        // 7. Cleanup
+        for e in s_L.iter_mut() {
+            e.zeroize();
+        }
+        for e in s_R.iter_mut() {
+            e.zeroize();
+        }
+        for e in s_L_prime.iter_mut() {
+            e.zeroize();
+        }
+        y2.zeroize();
+        for b in betas.iter_mut() {
+            b.zeroize();
+        }
 
         Ok(R1CSProof {
-            A_I, A_O, S,
-            T_1, T_2, T_3, T_4, T_5, T_6,
-            t_x, t_x_blinding, e_blinding,
+            A_I,
+            A_O,
+            S,
+            T_1,
+            T_2,
+            T_3,
+            T_4,
+            T_5,
+            T_6,
+            t_x,
+            t_x_blinding,
+            e_blinding,
             ipp_proof,
-            S_prime, T_1_prime,
-            tc_x, tc_x_blinding, ec_blinding, t_cross,
-            S1_prime, S2_prime,
-            S_K,
-            r_blinding, alpha_blinding,
+            S_prime,
+            T_1_prime,
+            tc_x,
+            tc_x_blinding,
+            ec_blinding,
+            t_cross,
+            S1_prime,
+            S2_prime,
+            S3_prime,
+            S4_prime,
+            S_Ks,
+            r_blinding,
+            r_blinding2,
+            alpha_blindings,
             ecp_batched,
         })
     }
 }
+

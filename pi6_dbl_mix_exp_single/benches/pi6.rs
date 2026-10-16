@@ -175,7 +175,7 @@ impl KShuffleGadget {
         let proof = cs.prove(
             c1_prime, c2_prime, r_prime, k_fold, num_rounds,
             d1_prime, d2_prime, r_prime2, alphas, d1_raw, d2_raw,
-            Some(input), block_size,
+            Some(input), k_original, // Pi_6: one anchor group covering all k_original entries (single alpha)
         )?;
         Ok((proof, output_commitment))
     }
@@ -223,7 +223,7 @@ impl KShuffleGadget {
         cs.verify(
             proof, c1_prime, c2_prime, c1_raw, c2_raw, e_challenge,
             d1_prime, d2_prime, d1_raw, d2_raw,
-            alpha_pubs, block_size,
+            alpha_pubs, k_original,
         )
     }
 }
@@ -283,7 +283,7 @@ fn derive_challenge_e(
         ts.append_message(b"d2p", bytes);
     }
     if let Some(bytes) = anchor_bytes {
-        ts.append_message(b"K_anchors", bytes); // per-voter K_beta 
+        ts.append_message(b"K_anchors", bytes); // single anchor K = g^alpha
     }
     if verbose {
         eprintln!(
@@ -834,7 +834,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
     println!();
     println!("================================================================");
-    println!("  Pi_4 benchmark: shuffle-and-exponentiate (DbleMixExp)");
+    println!("  Pi_6 benchmark: shuffle-and-exponentiate (DbleMixExp), one exponent shared by all voters");
     println!("  Configurations ({} total):", configs.len());
     println!("  * NOTE: This is a Dual-Shuffle. The total ciphertexts processed is 2 * N.");
     for (idx, &(n, k, nb, bs)) in configs.iter().enumerate() {
@@ -843,8 +843,8 @@ fn custom_benchmark(c: &mut Criterion) {
     println!("  Features: {}", features);
     println!("================================================================");
 
-    let input_ciph_path = "./maya_ristretto_pi4_input_ciph.bin";
-    let output_bundle_path = "./maya_ristretto_pi4_output_bundle.bin";
+    let input_ciph_path = "./maya_ristretto_pi6_input_ciph.bin";
+    let output_bundle_path = "./maya_ristretto_pi6_output_bundle.bin";
 
     struct RunResult {
         n: usize,
@@ -1036,8 +1036,8 @@ fn custom_benchmark(c: &mut Criterion) {
         // [3b] Rerandomization for D (second group)
         let t_rerand2_start = Instant::now();
         let r2_values: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng)).collect();
-        // Per-voter alpha: one alpha_beta per block (voter), anchor K_beta = g^{alpha_beta}.
-        let alphas: Vec<Scalar> = (0..num_blocks).map(|_| Scalar::random(&mut rng)).collect();
+       // Pi_6: one alpha shared by all blocks (voters)
+        let alphas: Vec<Scalar> = vec![Scalar::random(&mut rng)];
         let alpha_pubs: Vec<RistrettoPoint> = alphas.iter().map(|a| &g_table * a).collect();
 
        
@@ -1053,7 +1053,7 @@ fn custom_benchmark(c: &mut Criterion) {
                 .zip(r2_values.par_iter())
                 .enumerate()
                 .for_each(|(j, ((a, b), r2))| {
-                    let alpha = alphas[j / block_size];
+                    let alpha = alphas[0];
                     *a = &*a * alpha + &g_table * r2;
                     *b = &*b * alpha + &f2_table * r2;
                 });
@@ -1064,7 +1064,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let mut d1p = d1_prime_init;
             let mut d2p = d2_prime_init;
             for (j, r2) in r2_values.iter().enumerate() {
-                let alpha = alphas[j / block_size];
+                let alpha = alphas[0];
                 d1p[j] = &d1p[j] * alpha + &g_table * r2;
                 d2p[j] = &d2p[j] * alpha + &f2_table * r2;
             }
@@ -1317,14 +1317,14 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // CRITERION: Prover
         {
-            let label = format!("pi4/P/n={}/B={}/b={}", n_input, num_blocks, block_size);
+            let label = format!("pi6/P/n={}/B={}/b={}", n_input, num_blocks, block_size);
 
             let mut rng_b = rand::thread_rng();
             let c1_b: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_b)).collect();
             let c2_b: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_b)).collect();
             let d1_b: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_b)).collect();
             let d2_b: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_b)).collect();
-            let alphas_b: Vec<Scalar> = (0..num_blocks).map(|_| Scalar::random(&mut rng_b)).collect();
+            let alphas_b: Vec<Scalar> = vec![Scalar::random(&mut rng_b)];
             let alpha_pubs_b: Vec<RistrettoPoint> = alphas_b.iter().map(|a| &g_table * a).collect();
             let anchor_b_bytes = batch_compress(&alpha_pubs_b);
             let alpha_pubs_b_c = blob_to_compressed(&anchor_b_bytes);
@@ -1363,7 +1363,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let (d1p_b, d2p_b): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) = {
                 let (d1s, d2s): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) =
                     d1_b.par_iter().zip(d2_b.par_iter()).enumerate()
-                        .map(|(i, (p1, p2))| { let a = alphas_b[i / block_size]; (p1 * a, p2 * a) })
+                        .map(|(i, (p1, p2))| { let a = alphas_b[0]; (p1 * a, p2 * a) })
                         .unzip();
                 idx_b.par_iter().zip(rv2_b.par_iter())
                     .map(|(&i, r2)| (d1s[i] + &g_table * r2, d2s[i] + &f2_table * r2))
@@ -1373,7 +1373,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let (d1p_b, d2p_b): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) = {
                 let (d1s, d2s): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) =
                     d1_b.iter().zip(d2_b.iter()).enumerate()
-                        .map(|(i, (p1, p2))| { let a = alphas_b[i / block_size]; (p1 * a, p2 * a) })
+                        .map(|(i, (p1, p2))| { let a = alphas_b[0]; (p1 * a, p2 * a) })
                         .unzip();
                 idx_b.iter().zip(rv2_b.iter())
                     .map(|(&i, r2)| (d1s[i] + &g_table * r2, d2s[i] + &f2_table * r2))
@@ -1431,14 +1431,14 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // CRITERION: Verifier
         {
-            let label = format!("pi4/V/n={}/B={}/b={}", n_input, num_blocks, block_size);
+            let label = format!("pi6/V/n={}/B={}/b={}", n_input, num_blocks, block_size);
 
             let mut rng_v = rand::thread_rng();
             let c1_v: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_v)).collect();
             let c2_v: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_v)).collect();
             let d1_v: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_v)).collect();
             let d2_v: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_v)).collect();
-            let alphas_v: Vec<Scalar> = (0..num_blocks).map(|_| Scalar::random(&mut rng_v)).collect();
+            let alphas_v: Vec<Scalar> = vec![Scalar::random(&mut rng_v)];
             let alpha_pubs_v: Vec<RistrettoPoint> = alphas_v.iter().map(|a| &g_table * a).collect();
             let anchor_v_bytes = batch_compress(&alpha_pubs_v);
             let alpha_pubs_v_c = blob_to_compressed(&anchor_v_bytes);
@@ -1477,7 +1477,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let (d1p_v, d2p_v): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) = {
                 let (d1s, d2s): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) =
                     d1_v.par_iter().zip(d2_v.par_iter()).enumerate()
-                        .map(|(i, (p1, p2))| { let a = alphas_v[i / block_size]; (p1 * a, p2 * a) })
+                        .map(|(i, (p1, p2))| { let a = alphas_v[0]; (p1 * a, p2 * a) })
                         .unzip();
                 idx_v.par_iter().zip(rv2_v.par_iter())
                     .map(|(&i, r2)| (d1s[i] + &g_table * r2, d2s[i] + &f2_table * r2))
@@ -1487,7 +1487,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let (d1p_v, d2p_v): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) = {
                 let (d1s, d2s): (Vec<RistrettoPoint>, Vec<RistrettoPoint>) =
                     d1_v.iter().zip(d2_v.iter()).enumerate()
-                        .map(|(i, (p1, p2))| { let a = alphas_v[i / block_size]; (p1 * a, p2 * a) })
+                        .map(|(i, (p1, p2))| { let a = alphas_v[0]; (p1 * a, p2 * a) })
                         .unzip();
                 idx_v.iter().zip(rv2_v.iter())
                     .map(|(&i, r2)| (d1s[i] + &g_table * r2, d2s[i] + &f2_table * r2))
@@ -1584,9 +1584,9 @@ fn custom_benchmark(c: &mut Criterion) {
 
     let read_criterion_mean_ms = |n: usize, num_blocks: usize, block_size: usize, role: &str| -> Option<f64> {
         let label = if role == "prover" {
-            format!("pi4/P/n={}/B={}/b={}", n, num_blocks, block_size)
+            format!("pi6/P/n={}/B={}/b={}", n, num_blocks, block_size)
         } else {
-            format!("pi4/V/n={}/B={}/b={}", n, num_blocks, block_size)
+            format!("pi6/V/n={}/B={}/b={}", n, num_blocks, block_size)
         };
         let dir_name = label.replace('/', "_");
         let json_path = format!("target/criterion/{}/new/estimates.json", dir_name);

@@ -46,20 +46,25 @@ pub struct R1CSProof {
     /// K-ary Bulletproof for main circuit
     pub(super) ipp_proof: prove_ipa,
 
-    /// Shuffle consistency commitments (pi5: single group, no S3/S4)
+    /// Shuffle consistency commitments 
     pub(super) S_prime: CompressedRistretto,
     pub(super) T_1_prime: CompressedRistretto,
     pub(super) S1_prime: CompressedRistretto,
     pub(super) S2_prime: CompressedRistretto,
-    pub(super) S_K: CompressedRistretto,
+    pub(super) S3_prime: CompressedRistretto,
+    pub(super) S4_prime: CompressedRistretto,
+    /// Per-voter anchor masks S_K
+    pub(super) S_Ks: Vec<CompressedRistretto>,
 
-    /// Consistency check scalars (pi5: no r_blinding2)
+    /// Consistency check scalars 
     pub(super) tc_x: Scalar,
     pub(super) tc_x_blinding: Scalar,
     pub(super) ec_blinding: Scalar,
     pub(super) t_cross: Scalar,
     pub(super) r_blinding: Scalar,
-    pub(super) alpha_blinding: Scalar,
+    pub(super) r_blinding2: Scalar,
+    /// Per-voter anchor responses
+    pub(super) alpha_blindings: Vec<Scalar>,
 
     /// Batched consistency proof
     pub(super) ecp_batched: prove_ecp,
@@ -70,7 +75,6 @@ impl R1CSProof {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        // 14 compressed points
         buf.extend_from_slice(self.A_I.as_bytes());
         buf.extend_from_slice(self.A_O.as_bytes());
         buf.extend_from_slice(self.S.as_bytes());
@@ -84,9 +88,9 @@ impl R1CSProof {
         buf.extend_from_slice(self.T_1_prime.as_bytes());
         buf.extend_from_slice(self.S1_prime.as_bytes());
         buf.extend_from_slice(self.S2_prime.as_bytes());
-        buf.extend_from_slice(self.S_K.as_bytes());
+        buf.extend_from_slice(self.S3_prime.as_bytes());
+        buf.extend_from_slice(self.S4_prime.as_bytes());
 
-        // 9 scalars
         buf.extend_from_slice(self.t_x.as_bytes());
         buf.extend_from_slice(self.t_x_blinding.as_bytes());
         buf.extend_from_slice(self.e_blinding.as_bytes());
@@ -95,7 +99,15 @@ impl R1CSProof {
         buf.extend_from_slice(self.ec_blinding.as_bytes());
         buf.extend_from_slice(self.t_cross.as_bytes());
         buf.extend_from_slice(self.r_blinding.as_bytes());
-        buf.extend_from_slice(self.alpha_blinding.as_bytes());
+        buf.extend_from_slice(self.r_blinding2.as_bytes());
+        buf.extend_from_slice(&(self.S_Ks.len() as u64).to_le_bytes());
+        for p in &self.S_Ks {
+            buf.extend_from_slice(p.as_bytes());
+        }
+        buf.extend_from_slice(&(self.alpha_blindings.len() as u64).to_le_bytes());
+        for s in &self.alpha_blindings {
+            buf.extend_from_slice(s.as_bytes());
+        }
 
         let ipp_proof_bytes = self.ipp_proof.to_bytes();
         let ecp_batched_bytes = self.ecp_batched.to_bytes();
@@ -111,10 +123,10 @@ impl R1CSProof {
 
     /// Deserializes the proof from a byte slice.
     pub fn from_bytes(slice: &[u8]) -> Result<R1CSProof, ProofError> {
-        let point_count = 14;
+        let point_count = 15;
         let scalar_count = 9;
         let fixed_len = (point_count + scalar_count) * 32;
-        let len_prefix_count = 2;
+        let len_prefix_count = 4; // S_Ks, alpha_blindings, ipp, ecp
         let len_prefix_len = len_prefix_count * 8;
 
         if slice.len() < fixed_len + len_prefix_len {
@@ -129,20 +141,21 @@ impl R1CSProof {
             CompressedRistretto(read32(&slice[pos..]))
         };
 
-        let A_I       = read_point(0);
-        let A_O       = read_point(1);
-        let S         = read_point(2);
-        let T_1       = read_point(3);
-        let T_2       = read_point(4);
-        let T_3       = read_point(5);
-        let T_4       = read_point(6);
-        let T_5       = read_point(7);
-        let T_6       = read_point(8);
-        let S_prime   = read_point(9);
+        let A_I = read_point(0);
+        let A_O = read_point(1);
+        let S = read_point(2);
+        let T_1 = read_point(3);
+        let T_2 = read_point(4);
+        let T_3 = read_point(5);
+        let T_4 = read_point(6);
+        let T_5 = read_point(7);
+        let T_6 = read_point(8);
+        let S_prime = read_point(9);
         let T_1_prime = read_point(10);
-        let S1_prime  = read_point(11);
-        let S2_prime  = read_point(12);
-        let S_K       = read_point(13);
+        let S1_prime = read_point(11);
+        let S2_prime = read_point(12);
+        let S3_prime = read_point(13);
+        let S4_prime = read_point(14);
 
         offset = point_count * 32;
 
@@ -152,15 +165,15 @@ impl R1CSProof {
                 .ok_or(ProofError::FormatError)
         };
 
-        let t_x             = read_scalar(0)?;
-        let t_x_blinding    = read_scalar(1)?;
-        let e_blinding      = read_scalar(2)?;
-        let tc_x            = read_scalar(3)?;
-        let tc_x_blinding   = read_scalar(4)?;
-        let ec_blinding     = read_scalar(5)?;
-        let t_cross         = read_scalar(6)?;
-        let r_blinding      = read_scalar(7)?;
-        let alpha_blinding  = read_scalar(8)?;
+        let t_x = read_scalar(0)?;
+        let t_x_blinding = read_scalar(1)?;
+        let e_blinding = read_scalar(2)?;
+        let tc_x = read_scalar(3)?;
+        let tc_x_blinding = read_scalar(4)?;
+        let ec_blinding = read_scalar(5)?;
+        let t_cross = read_scalar(6)?;
+        let r_blinding = read_scalar(7)?;
+        let r_blinding2 = read_scalar(8)?;
 
         offset += scalar_count * 32;
 
@@ -176,8 +189,30 @@ impl R1CSProof {
             Ok(u64::from_le_bytes(len_bytes) as usize)
         };
 
-        let ipp_proof_len    = read_len(&mut offset)?;
-        let ecp_batched_len  = read_len(&mut offset)?;
+        // Per-voter anchor vectors
+        let n_sk = read_len(&mut offset)?;
+        if n_sk > (slice.len() - offset) / 32 {
+            return Err(ProofError::FormatError);
+        }
+        let mut S_Ks = Vec::with_capacity(n_sk);
+        for _ in 0..n_sk {
+            S_Ks.push(CompressedRistretto(read32(&slice[offset..])));
+            offset += 32;
+        }
+        let n_ab = read_len(&mut offset)?;
+        if n_ab != n_sk || n_ab > (slice.len() - offset) / 32 {
+            return Err(ProofError::FormatError);
+        }
+        let mut alpha_blindings = Vec::with_capacity(n_ab);
+        for _ in 0..n_ab {
+            let s: Scalar = Option::from(Scalar::from_canonical_bytes(read32(&slice[offset..])))
+                .ok_or(ProofError::FormatError)?;
+            alpha_blindings.push(s);
+            offset += 32;
+        }
+
+        let ipp_proof_len = read_len(&mut offset)?;
+        let ecp_batched_len = read_len(&mut offset)?;
 
         // Verify total length
         let total_expected_len = offset + ipp_proof_len + ecp_batched_len;
@@ -187,20 +222,39 @@ impl R1CSProof {
         }
 
         // Deserialize proofs
-        let ipp_proof    = prove_ipa::from_bytes(&slice[offset..offset + ipp_proof_len])?;
-        offset          += ipp_proof_len;
-        let ecp_batched  = prove_ecp::from_bytes(&slice[offset..offset + ecp_batched_len])?;
+        let ipp_proof = prove_ipa::from_bytes(&slice[offset..offset + ipp_proof_len])?;
+        offset += ipp_proof_len;
+
+        let ecp_batched = prove_ecp::from_bytes(&slice[offset..offset + ecp_batched_len])?;
 
         Ok(R1CSProof {
-            A_I, A_O, S,
-            T_1, T_2, T_3, T_4, T_5, T_6,
-            t_x, t_x_blinding, e_blinding,
+            A_I,
+            A_O,
+            S,
+            T_1,
+            T_2,
+            T_3,
+            T_4,
+            T_5,
+            T_6,
+            t_x,
+            t_x_blinding,
+            e_blinding,
             ipp_proof,
-            S_prime, T_1_prime,
-            tc_x, tc_x_blinding, ec_blinding, t_cross,
-            S1_prime, S2_prime,
-            S_K,
-            r_blinding, alpha_blinding,
+            S_prime,
+            T_1_prime,
+            tc_x,
+            tc_x_blinding,
+            ec_blinding,
+            t_cross,
+            S1_prime,
+            S2_prime,
+            S3_prime,
+            S4_prime,
+            S_Ks,
+            r_blinding,
+            r_blinding2,
+            alpha_blindings,
             ecp_batched,
         })
     }

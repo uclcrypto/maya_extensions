@@ -149,7 +149,7 @@ impl KShuffleGadget {
         let (output_commitment, output_vars) = prover.commit_vec(output, v_blinding, k_original);
         let mut cs = prover.finalize_inputs();
         Self::fill_cs(&mut cs, &output_vars, input, k_original, num_blocks, block_size);
-        let proof = cs.prove_pi5(c1_prime, c2_prime, r_prime, k_fold, num_rounds,
+        let proof = cs.prove_pi4(c1_prime, c2_prime, r_prime, k_fold, num_rounds,
                                   h_rest, c1_agg, alpha)?;
         Ok((proof, output_commitment))
     }
@@ -184,12 +184,12 @@ impl KShuffleGadget {
         let mut cs = verifier.finalize_inputs();
         let k_original = c1_prime.len();
         Self::fill_cs(&mut cs, &output_vars, input, k_original, num_blocks, block_size);
-        cs.verify_pi5(proof, c1_prime, c2_prime, c1_raw, c2_raw, e_challenge,
+        cs.verify_pi4(proof, c1_prime, c2_prime, c1_raw, c2_raw, e_challenge,
                       h_rest, alpha_pub.compress())
     }
 }
 
-fn derive_challenge_e_pi5(
+fn derive_challenge_e_pi4(
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
     c1_bytes: &[u8],
@@ -206,8 +206,8 @@ fn derive_challenge_e_pi5(
         .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .is_some();
 
-    let mut ts = Transcript::new(b"FiatShamir-e-pi5");
-    ts.append_message(b"dom-sep", b"challenge-e-derivation-pi5");
+    let mut ts = Transcript::new(b"FiatShamir-e-pi4");
+    ts.append_message(b"dom-sep", b"challenge-e-derivation-pi4");
 
     ts.commit_point(b"pk_g",    &pc_gens.B.compress());
     ts.commit_point(b"pk_h_rest", &h_rest.compress());
@@ -226,7 +226,7 @@ fn derive_challenge_e_pi5(
     ts.append_message(b"block_size", &(block_size as u64).to_le_bytes());
 
     if verbose {
-        eprintln!("[derive_e_pi5] n={}: transcript feed {:?}", n_original, t_transcript.elapsed());
+        eprintln!("[derive_e_pi4] n={}: transcript feed {:?}", n_original, t_transcript.elapsed());
     }
 
     let t_expand = Instant::now();
@@ -303,7 +303,7 @@ fn derive_challenge_e_pi5(
     e.resize(n_padded, Scalar::ZERO);
 
     if verbose {
-        eprintln!("[derive_e_pi5] n={}: seed-squeeze + scalar expand {:?}", n_original, t_expand.elapsed());
+        eprintln!("[derive_e_pi4] n={}: seed-squeeze + scalar expand {:?}", n_original, t_expand.elapsed());
     }
     e
 }
@@ -362,7 +362,7 @@ fn batch_decompress(blob: &[u8]) -> std::io::Result<Vec<RistrettoPoint>> {
 }
 
 // File I/O Helpers 
-fn encode_ciphertexts_pi5(
+fn encode_ciphertexts_pi4(
     c1: &[RistrettoPoint],
     c2: &[RistrettoPoint],
     g: &RistrettoPoint,
@@ -402,7 +402,7 @@ fn store_bytes(path: &str, bytes: &[u8]) -> std::io::Result<usize> {
     fh.sync_all()?;
     Ok(bytes.len())
 }
-fn read_ciphertexts_pi5(
+fn read_ciphertexts_pi4(
     path: &str,
 ) -> std::io::Result<(
     Vec<RistrettoPoint>,
@@ -546,7 +546,7 @@ fn read_proof_bundle(
     Ok((proof, out_commitment, c1_prime, c2_prime, c1p_blob, c2p_blob))
 }
 
-fn read_ciphertexts_pi5_raw(path: &str) -> std::io::Result<(
+fn read_ciphertexts_pi4_raw(path: &str) -> std::io::Result<(
     Vec<u8>, Vec<u8>,
     RistrettoPoint, RistrettoPoint, RistrettoPoint, RistrettoPoint,
 )> {
@@ -647,7 +647,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
     println!();
     println!("================================================================");
-    println!("  Pi_5 benchmark: decryption mixnet");
+    println!("  Pi_4 benchmark: decryption mixnet");
     println!("  Configurations ({} total):", configs.len());
     for (idx, &(n, _k, nb, bs)) in configs.iter().enumerate() {
         println!("    {:>2}.  N = {:>9}   B = {}   b = {}", idx + 1, n, nb, bs);
@@ -655,8 +655,8 @@ fn custom_benchmark(c: &mut Criterion) {
     println!("  Features: {}", features);
     println!("================================================================");
 
-    let input_ciph_path    = "./maya_ristretto_pi5_input_ciph.bin";
-    let output_bundle_path = "./maya_ristretto_pi5_output_bundle.bin";
+    let input_ciph_path    = "./maya_ristretto_pi4_input_ciph.bin";
+    let output_bundle_path = "./maya_ristretto_pi4_output_bundle.bin";
 
     struct RunResult {
         n: usize, k: usize, d: usize, num_blocks: usize, block_size: usize,
@@ -696,7 +696,7 @@ fn custom_benchmark(c: &mut Criterion) {
         let alpha_pub_orig = pc_gens_setup.B * alpha;
 
         // Untimed:  Generating and compressing it is not mixer work: the mixer receives the list from the bulletin board / previous mixer.
-        let input_blob = encode_ciphertexts_pi5(
+        let input_blob = encode_ciphertexts_pi4(
             &c1_raw, &c2_raw, &pc_gens_setup.B, &h_rest_orig, &pc_gens_setup.B_blinding, &alpha_pub_orig,
         );
         drop((c1_raw, c2_raw));
@@ -714,7 +714,7 @@ fn custom_benchmark(c: &mut Criterion) {
         #[cfg(feature = "parallel")]
         let ((pc_gens, bp_gens), (c1_bytes, c2_bytes, _g_f, h_rest_f, _h_f, alpha_pub_f)) = rayon::join(
             || rayon::join(|| PedersenGens::default(), || BulletproofGens::new(n_padded, 1)),
-            || read_ciphertexts_pi5_raw(input_ciph_path).expect("read_ciphertexts_pi5_raw failed"),
+            || read_ciphertexts_pi4_raw(input_ciph_path).expect("read_ciphertexts_pi4_raw failed"),
         );
         #[cfg(not(feature = "parallel"))]
         let pc_gens = PedersenGens::default();
@@ -722,7 +722,7 @@ fn custom_benchmark(c: &mut Criterion) {
         let bp_gens = BulletproofGens::new(n_padded, 1);
         #[cfg(not(feature = "parallel"))]
         let (c1_bytes, c2_bytes, _g_f, h_rest_f, _h_f, alpha_pub_f) =
-            read_ciphertexts_pi5_raw(input_ciph_path).expect("read_ciphertexts_pi5_raw failed");
+            read_ciphertexts_pi4_raw(input_ciph_path).expect("read_ciphertexts_pi4_raw failed");
         let t_gen = t_gen_start.elapsed();
 
         let g = pc_gens.B;
@@ -797,7 +797,7 @@ fn custom_benchmark(c: &mut Criterion) {
         let c1p_bytes = batch_compress(&c1_prime);
         let c2p_bytes = batch_compress(&c2_prime);
 
-        let input_padded = derive_challenge_e_pi5(
+        let input_padded = derive_challenge_e_pi4(
             &pc_gens, &bp_gens,
             &c1_bytes, &c2_bytes, &c1p_bytes, &c2p_bytes,
             &h_rest_f,
@@ -829,7 +829,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // [5] Proof generation
         let t_proof_start = Instant::now();
-        let mut prover_transcript = Transcript::new(b"MAYA-Pi5-v1");
+        let mut prover_transcript = Transcript::new(b"MAYA-pi4-v1");
         let (proof, out_commitment) = KShuffleGadget::prove(
             &pc_gens, &bp_gens, &mut prover_transcript,
             &input_padded, &output_padded,
@@ -862,7 +862,7 @@ fn custom_benchmark(c: &mut Criterion) {
                 || rayon::join(|| PedersenGens::default(), || BulletproofGens::new(n_padded, 1)),
                 || rayon::join(
                     || read_proof_bundle_raw(output_bundle_path).expect("read_proof_bundle_raw failed"),
-                    || read_ciphertexts_pi5_raw(input_ciph_path).expect("read_ciphertexts_pi5_raw failed"),
+                    || read_ciphertexts_pi4_raw(input_ciph_path).expect("read_ciphertexts_pi4_raw failed"),
                 ),
             );
         #[cfg(not(feature = "parallel"))]
@@ -874,13 +874,13 @@ fn custom_benchmark(c: &mut Criterion) {
             read_proof_bundle_raw(output_bundle_path).expect("read_proof_bundle_raw failed");
         #[cfg(not(feature = "parallel"))]
         let (c1_orig_bytes, c2_orig_bytes, _g_v, h_rest_v, _h_v, alpha_pub_v) =
-            read_ciphertexts_pi5_raw(input_ciph_path).expect("read_ciphertexts_pi5_raw failed");
+            read_ciphertexts_pi4_raw(input_ciph_path).expect("read_ciphertexts_pi4_raw failed");
         let t_v_gen = t_v_gen_start.elapsed();
 
 
         // [2] Derive e
         let t_e_start = Instant::now();
-        let input_padded_r = derive_challenge_e_pi5(
+        let input_padded_r = derive_challenge_e_pi4(
             &v_pc_gens, &v_bp_gens,
             &c1_orig_bytes, &c2_orig_bytes,
             &c1p_r_bytes, &c2p_r_bytes,
@@ -900,7 +900,7 @@ fn custom_benchmark(c: &mut Criterion) {
         // [3] Verify  
         let t_verify_start = Instant::now();
         let e_original_r = &input_padded_r[..n_input];
-        let mut verifier_transcript = Transcript::new(b"MAYA-Pi5-v1");
+        let mut verifier_transcript = Transcript::new(b"MAYA-pi4-v1");
         let result = KShuffleGadget::verify(
             &v_pc_gens, &v_bp_gens, &mut verifier_transcript,
             &proof_r, &input_padded_r, out_commitment_r,
@@ -984,7 +984,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // CRITERION: Prover
         {
-            let label = format!("pi5/P/n={}/B={}/b={}", n_input, num_blocks, block_size);
+            let label = format!("pi4/P/n={}/B={}/b={}", n_input, num_blocks, block_size);
 
             let mut rng_b = rand::thread_rng();
             let c1_b: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_b)).collect();
@@ -1035,7 +1035,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let c1p_b_bytes = batch_compress(&c1p_b);
             let c2p_b_bytes = batch_compress(&c2p_b);
 
-            let inp_b = derive_challenge_e_pi5(
+            let inp_b = derive_challenge_e_pi4(
                 &pc_gens, &bp_gens,
                 &c1_b_bytes, &c2_b_bytes, &c1p_b_bytes, &c2p_b_bytes,
                 &h_rest_b, num_blocks, block_size, n_input, circuit_n,
@@ -1054,7 +1054,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
             c.bench_function(&label, |b| {
                 b.iter(|| {
-                    let mut t = Transcript::new(b"MAYA-Pi5-v1");
+                    let mut t = Transcript::new(b"MAYA-pi4-v1");
                     let mut bench_rng = rand::thread_rng();
                     KShuffleGadget::prove(
                         &pc_gens, &bp_gens, &mut t,
@@ -1074,7 +1074,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // CRITERION: Verifier
         {
-            let label = format!("pi5/V/n={}/B={}/b={}", n_input, num_blocks, block_size);
+            let label = format!("pi4/V/n={}/B={}/b={}", n_input, num_blocks, block_size);
 
             let mut rng_v = rand::thread_rng();
             let c1_v: Vec<RistrettoPoint> = (0..n_input).map(|_| RistrettoPoint::random(&mut rng_v)).collect();
@@ -1125,7 +1125,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let c1p_v_bytes = batch_compress(&c1p_v);
             let c2p_v_bytes = batch_compress(&c2p_v);
 
-            let inp_v = derive_challenge_e_pi5(
+            let inp_v = derive_challenge_e_pi4(
                 &pc_gens, &bp_gens,
                 &c1_v_bytes, &c2_v_bytes, &c1p_v_bytes, &c2p_v_bytes,
                 &h_rest_v2, num_blocks, block_size, n_input, circuit_n,
@@ -1142,7 +1142,7 @@ fn custom_benchmark(c: &mut Criterion) {
                 RistrettoPoint::vartime_multiscalar_mul(e_v2.iter(), c1_v.iter())
             };
 
-            let mut pt = Transcript::new(b"MAYA-Pi5-v1");
+            let mut pt = Transcript::new(b"MAYA-pi4-v1");
             let mut setup_rng = rand::thread_rng();
             let (proof_v, out_com_v) = KShuffleGadget::prove(
                 &pc_gens, &bp_gens, &mut pt,
@@ -1159,7 +1159,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
             c.bench_function(&label, |b| {
                 b.iter(|| {
-                    let mut t = Transcript::new(b"MAYA-Pi5-v1");
+                    let mut t = Transcript::new(b"MAYA-pi4-v1");
                     let res = KShuffleGadget::verify(
                         &pc_gens, &bp_gens, &mut t, &proof_v, &inp_v, out_com_v,
                         &c1p_v_c, &c2p_v_c,
@@ -1186,9 +1186,9 @@ fn custom_benchmark(c: &mut Criterion) {
 
     let read_criterion_mean_ms = |n: usize, num_blocks: usize, block_size: usize, role: &str| -> Option<f64> {
         let label = if role == "prover" {
-            format!("pi5/P/n={}/B={}/b={}", n, num_blocks, block_size)
+            format!("pi4/P/n={}/B={}/b={}", n, num_blocks, block_size)
         } else {
-            format!("pi5/V/n={}/B={}/b={}", n, num_blocks, block_size)
+            format!("pi4/V/n={}/B={}/b={}", n, num_blocks, block_size)
         };
         let dir_name = label.replace('/', "_");
         let json_path = format!("target/criterion/{}/new/estimates.json", dir_name);
