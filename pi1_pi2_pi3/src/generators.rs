@@ -1,4 +1,3 @@
-#![allow(unused_variables)]
 #![allow(non_snake_case)]
 #![deny(missing_docs)]
 
@@ -35,8 +34,6 @@ impl PedersenGens {
 
 impl Default for PedersenGens {
     fn default() -> Self {
-        use std::time::Instant;
-        let t0 = Instant::now();
         let b0 = RISTRETTO_BASEPOINT_COMPRESSED.as_bytes();
 
         let derive_generator = |label: &[u8]| -> RistrettoPoint {
@@ -74,6 +71,38 @@ impl Default for PedersenGens {
     }
 }
 
+/// Derive `count` padding generators from a transcript seed.
+pub(crate) fn fold_pad_generators(
+    domain: &[u8],
+    seed: &[u8; 32],
+    count: usize,
+) -> Vec<RistrettoPoint> {
+    let mut key = Vec::with_capacity(domain.len() + seed.len());
+    key.extend_from_slice(domain);
+    key.extend_from_slice(seed);
+    let base_mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
+
+    (0..count)
+        .map(|i| {
+            let mut msg = [0u8; 9];
+            msg[0..4].copy_from_slice(b"pad_");
+            msg[4..8].copy_from_slice(&(i as u32).to_le_bytes());
+            msg[8] = 0x01;
+            let mut mac1 = base_mac.clone();
+            mac1.update(&msg);
+            let eta1: [u8; 32] = mac1.finalize().into_bytes().into();
+            msg[8] = 0x02;
+            let mut mac2 = base_mac.clone();
+            mac2.update(&msg);
+            let eta2: [u8; 32] = mac2.finalize().into_bytes().into();
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&eta1);
+            buf[32..].copy_from_slice(&eta2);
+            RistrettoPoint::from_uniform_bytes(&buf)
+        })
+        .collect()
+}
+
 ///
 #[derive(Clone)]
 pub struct BulletproofGens {
@@ -104,10 +133,8 @@ impl BulletproofGens {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
-            use std::time::Instant;
 
             let gen_party = |type_byte: u8, party_index: u32| -> ([u8; 32], Vec<RistrettoPoint>) {
-                let t0 = Instant::now();
                 let mut label = [type_byte, 0u8, 0, 0, 0];
                 label[1..5].copy_from_slice(&party_index.to_le_bytes());
                 let mut mac = HmacSha256::new_from_slice(b"GeneratorsChain").unwrap();
@@ -116,7 +143,6 @@ impl BulletproofGens {
 
                 let base_mac = HmacSha256::new_from_slice(&seed).unwrap();
 
-                let t1 = Instant::now();
                 let pts: Vec<RistrettoPoint> = (0..gens_capacity)
                     .into_par_iter()
                     .map(|i| {
@@ -239,6 +265,7 @@ impl BulletproofGens {
     }
 
     /// Return an iterator over the aggregation of the parties' H generators with given size `n`.
+    #[allow(dead_code)]
     pub(crate) fn H(&self, n: usize, m: usize) -> impl Iterator<Item = &RistrettoPoint> {
         AggregatedGensIter {
             n,
@@ -312,3 +339,50 @@ impl<'a> BulletproofGensShare<'a> {
 
 
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregated_gens_iter_matches_flat_map() {
+        let gens = BulletproofGens::new(64, 8);
+
+        let helper = |n: usize, m: usize| {
+            let agg_G: Vec<RistrettoPoint> = gens.G(n, m).cloned().collect();
+            let flat_G: Vec<RistrettoPoint> = gens
+                .G_vec
+                .iter()
+                .take(m)
+                .flat_map(move |G_j| G_j.iter().take(n))
+                .cloned()
+                .collect();
+
+            let agg_H: Vec<RistrettoPoint> = gens.H(n, m).cloned().collect();
+            let flat_H: Vec<RistrettoPoint> = gens
+                .H_vec
+                .iter()
+                .take(m)
+                .flat_map(move |H_j| H_j.iter().take(n))
+                .cloned()
+                .collect();
+
+            assert_eq!(agg_G, flat_G);
+            assert_eq!(agg_H, flat_H);
+        };
+
+        helper(64, 8);
+        helper(64, 4);
+        helper(64, 2);
+        helper(64, 1);
+        helper(32, 8);
+        helper(32, 4);
+        helper(32, 2);
+        helper(32, 1);
+        helper(16, 8);
+        helper(16, 4);
+        helper(16, 2);
+        helper(16, 1);
+    }
+}

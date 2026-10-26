@@ -180,12 +180,26 @@ impl R1CSProof {
         let t_cross = read_scalar!();
 
         let n_s_primes = read_u64!();
+        if n_s_primes
+            .checked_mul(32)
+            .and_then(|b| b.checked_add(offset))
+            .map_or(true, |end| end > slice.len())
+        {
+            return Err(ProofError::FormatError);
+        }
         let mut S_primes = Vec::with_capacity(n_s_primes);
         for _ in 0..n_s_primes {
             S_primes.push(read_point!());
         }
 
         let n_r_blindings = read_u64!();
+        if n_r_blindings
+            .checked_mul(32)
+            .and_then(|b| b.checked_add(offset))
+            .map_or(true, |end| end > slice.len())
+        {
+            return Err(ProofError::FormatError);
+        }
         let mut r_blindings = Vec::with_capacity(n_r_blindings);
         for _ in 0..n_r_blindings {
             r_blindings.push(read_scalar!());
@@ -194,7 +208,11 @@ impl R1CSProof {
         let ipp_proof_len = read_u64!();
         let ecp_batched_len = read_u64!();
 
-        if slice.len() != offset + ipp_proof_len + ecp_batched_len {
+        let total_expected_len = offset
+            .checked_add(ipp_proof_len)
+            .and_then(|l| l.checked_add(ecp_batched_len))
+            .ok_or(ProofError::FormatError)?;
+        if slice.len() != total_expected_len {
             return Err(ProofError::FormatError);
         }
 

@@ -72,6 +72,38 @@ impl Default for PedersenGens {
     }
 }
 
+/// Derive `count` padding generators from a transcript seed.
+pub(crate) fn fold_pad_generators(
+    domain: &[u8],
+    seed: &[u8; 32],
+    count: usize,
+) -> Vec<RistrettoPoint> {
+    let mut key = Vec::with_capacity(domain.len() + seed.len());
+    key.extend_from_slice(domain);
+    key.extend_from_slice(seed);
+    let base_mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
+
+    (0..count)
+        .map(|i| {
+            let mut msg = [0u8; 9];
+            msg[0..4].copy_from_slice(b"pad_");
+            msg[4..8].copy_from_slice(&(i as u32).to_le_bytes());
+            msg[8] = 0x01;
+            let mut mac1 = base_mac.clone();
+            mac1.update(&msg);
+            let eta1: [u8; 32] = mac1.finalize().into_bytes().into();
+            msg[8] = 0x02;
+            let mut mac2 = base_mac.clone();
+            mac2.update(&msg);
+            let eta2: [u8; 32] = mac2.finalize().into_bytes().into();
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&eta1);
+            buf[32..].copy_from_slice(&eta2);
+            RistrettoPoint::from_uniform_bytes(&buf)
+        })
+        .collect()
+}
+
 ///
 #[derive(Clone)]
 pub struct BulletproofGens {
@@ -234,6 +266,7 @@ impl BulletproofGens {
     }
 
     /// Return an iterator over the aggregation of the parties' H generators with given size `n`.
+    #[allow(dead_code)]
     pub(crate) fn H(&self, n: usize, m: usize) -> impl Iterator<Item = &RistrettoPoint> {
         AggregatedGensIter {
             n,

@@ -121,10 +121,10 @@ impl R1CSProof {
             return Err(ProofError::FormatError);
         }
 
-        let mut offset = 0;
+        let mut offset;
         use util::read32;
 
-        let mut read_point = |i: usize| -> CompressedRistretto {
+        let read_point = |i: usize| -> CompressedRistretto {
             let pos = i * 32;
             CompressedRistretto(read32(&slice[pos..]))
         };
@@ -146,7 +146,7 @@ impl R1CSProof {
 
         offset = point_count * 32;
 
-        let mut read_scalar = |i: usize| -> Result<Scalar, ProofError> {
+        let read_scalar = |i: usize| -> Result<Scalar, ProofError> {
             let pos = offset + i * 32;
             Option::from(Scalar::from_canonical_bytes(read32(&slice[pos..])))
                 .ok_or(ProofError::FormatError)
@@ -165,7 +165,7 @@ impl R1CSProof {
         offset += scalar_count * 32;
 
         // Read proof lengths
-        let mut read_len = |offset: &mut usize| -> Result<usize, ProofError> {
+        let read_len = |offset: &mut usize| -> Result<usize, ProofError> {
             if slice.len() < *offset + 8 {
                 return Err(ProofError::FormatError);
             }
@@ -180,7 +180,10 @@ impl R1CSProof {
         let ecp_batched_len  = read_len(&mut offset)?;
 
         // Verify total length
-        let total_expected_len = offset + ipp_proof_len + ecp_batched_len;
+        let total_expected_len = offset
+            .checked_add(ipp_proof_len)
+            .and_then(|l| l.checked_add(ecp_batched_len))
+            .ok_or(ProofError::FormatError)?;
 
         if slice.len() != total_expected_len {
             return Err(ProofError::FormatError);

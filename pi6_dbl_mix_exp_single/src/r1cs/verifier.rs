@@ -259,10 +259,13 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         d2_raw: Option<&[CompressedRistretto]>,
         alpha_pubs: Option<&[CompressedRistretto]>,
         block_size: usize,
+        k_fold: usize,
+        num_rounds: usize,
     ) -> Result<(), R1CSError> {
         use curve25519_dalek::traits::IsIdentity;
-        use inner_product_proof::inner_product;
+        use inner_product_proof::{inner_product, MAX_FOLD_FACTOR, MAX_FOLD_ROUNDS};
         use std::iter;
+        #[allow(unused_imports)]
         use util;
 
         let _do_print = std::env::var("VERBOSE").ok().filter(|v| v == "1" || v.eq_ignore_ascii_case("true")).is_some()&& !VERIFIER_TIMING_PRINTED.swap(true, Ordering::SeqCst);
@@ -272,7 +275,36 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         // 1. Checks & Padding
         let n = self.num_vars;
         let padded_n = self.num_inputs;
+        if padded_n == 0
+            || self.num_vars > padded_n
+            || k_fold < 2
+            || k_fold > MAX_FOLD_FACTOR
+            || num_rounds > MAX_FOLD_ROUNDS
+            || proof.ipp_proof.k != k_fold
+            || proof.ecp_batched.k != k_fold
+            || proof.ipp_proof.U_vecs.len() != num_rounds
+            || proof.ecp_batched.A_vecs.len() != num_rounds
+            || proof.ipp_proof.U_vecs.iter().any(|r| r.len() != 2 * k_fold - 2)
+            || proof.ecp_batched.A_vecs.iter().any(|r| r.len() != 2 * k_fold - 2)
+            || C1_prime.len() != C2_prime.len()
+            || C1_prime.len() > padded_n
+            || self.V.len() != 1
+            || c1_raw.len() != C1_prime.len()
+            || c2_raw.len() != C1_prime.len()
+            || e_challenge.len() != C1_prime.len()
+            || D1_prime.is_some() != D2_prime.is_some()
+            || D1_prime.is_some() != d1_raw.is_some()
+            || D1_prime.is_some() != d2_raw.is_some()
+            || D1_prime.is_some() != alpha_pubs.is_some()
+            || D1_prime.map_or(false, |l| l.len() != C1_prime.len())
+            || D2_prime.map_or(false, |l| l.len() != C1_prime.len())
+            || d1_raw.map_or(false, |l| l.len() != C1_prime.len())
+            || d2_raw.map_or(false, |l| l.len() != C1_prime.len())
+        {
+            return Err(R1CSError::FormatError);
+        }
         let k_fold = proof.ipp_proof.k;
+        #[allow(unused_variables)]
         let pad = padded_n - n;
 
         if self.bp_gens.gens_capacity < padded_n {
@@ -366,7 +398,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         let w_agg = self.transcript.challenge_scalar(b"w_agg");
 
         // 3. Scalar & Point Reconstruction
-        let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir) = proof
+        let (s_g_cir, s_h_cir, s_Q_cir, s_P_cir, s_U_cir, s_pad_cir, pad_points_cir) = proof
             .ipp_proof
             .verification_scalars(padded_n, self.transcript)
             .map_err(|_| R1CSError::VerificationError)?;
@@ -484,10 +516,14 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
         // 4. Verification Check Setup
         let chall_batched_ecp = self.transcript.challenge_scalar(b"chall_batched_ecp");
 
-        let (z_s_vec, s_P, s_A_vec) = proof
+        let (z_s_vec, s_P, s_A_vec, z_s_pad, ecp_pad_points) = proof
             .ecp_batched
             .verification_scalars(padded_n, self.transcript)
             .map_err(|_| R1CSError::VerificationError)?;
+
+        if s_pad_cir.len() != pad_points_cir.len() || z_s_pad.len() != ecp_pad_points.len() {
+            return Err(R1CSError::VerificationError);
+        }
 
         let _tp_r = Instant::now();
         let r = self.transcript.challenge_scalar(b"batching_r");
@@ -584,6 +620,7 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
             .chain(omegas.iter().map(|w| -w))
             .collect();
 
+        #[cfg(feature = "parallel")]
         let dual_rest_scalars: Vec<Scalar> = if dual_group_active {
             vec![s_S3_prime, s_S4_prime, s_F2_checkS].into_iter()
                 .chain(anchor_scalars.iter().cloned())
@@ -604,17 +641,6 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 ),
             );
             a2_sc.into_iter().chain(b2_sc).chain(c1p_sc).chain(c2p_sc).collect()
-        } else {
-            vec![]
-        };
-        #[cfg(not(feature = "parallel"))]
-        let dual_cipher_scalars: Vec<Scalar> = if dual_group_active {
-            let mut v = Vec::with_capacity(4 * k_original);
-            v.extend(e_challenge[0..k_original].iter().enumerate().map(|(i, ei)| *ei * s_A2_agg[i / block_size]));
-            v.extend(e_challenge[0..k_original].iter().enumerate().map(|(i, ei)| *ei * s_B2_agg[i / block_size]));
-            v.extend(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_sq));
-            v.extend(z_s_vec[0..k_original].iter().map(|z| z * r3 * chall_cb));
-            v
         } else {
             vec![]
         };
@@ -673,6 +699,8 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(dual_rest_scalars.into_iter())
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r4))
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r3))
+                .chain(s_pad_cir.iter().cloned())
+                .chain(z_s_pad.iter().map(|z| z * r4))
                 .collect();
 
             let _tp_b = Instant::now();
@@ -733,13 +761,13 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(dual_rest_points.into_iter())
                 .chain(pt_ecp_A0.into_iter())
                 .chain(pt_ecp_A1.into_iter())
+                .chain(pad_points_cir.iter().cloned())
+                .chain(ecp_pad_points.iter().cloned())
                 .collect();
 
-            assert_eq!(
-                rest_scalars.len(), rest_points.len(),
-                "Scalar/point count mismatch (rest): {} scalars, {} points",
-                rest_scalars.len(), rest_points.len()
-            );
+            if rest_scalars.len() != rest_points.len() {
+                return Err(R1CSError::FormatError);
+            }
 
             if _do_print {
                 eprintln!(
@@ -809,6 +837,8 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(dual_scalars.into_iter())
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r4))
                 .chain(s_A_vec.iter().map(|s_A| -s_A * r3))
+                .chain(s_pad_cir.iter().cloned())
+                .chain(z_s_pad.iter().map(|z| z * r4))
                 .collect();
 
             let dual_points: Vec<Option<RistrettoPoint>> = if dual_group_active {
@@ -859,7 +889,9 @@ impl<'a, 'b> VerifierCS<'a, 'b> {
                 .chain(C2_prime.iter().map(|c| c.decompress()))
                 .chain(dual_points.into_iter())
                 .chain(ecp_a0.into_iter())
-                .chain(ecp_a1.into_iter());
+                .chain(ecp_a1.into_iter())
+                .chain(pad_points_cir.iter().cloned().map(Some))
+                .chain(ecp_pad_points.iter().cloned().map(Some));
 
             let result = RistrettoPoint::optional_multiscalar_mul(combined_scalars, combined_points_iter)
                 .ok_or(R1CSError::VerificationError)?;

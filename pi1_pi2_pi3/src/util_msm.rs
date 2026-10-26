@@ -1,11 +1,10 @@
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
+use curve25519_dalek::traits::{Identity, VartimeMultiscalarMul};
 use rayon::prelude::*;
 
 
 const VARTIME_MIN_CHUNK: usize = 1024;
-const CT_MIN_CHUNK: usize = 256;
 
 /// Parallel chunked variable-time MSM.
 pub fn chunked_vartime_multiscalar_mul(
@@ -64,23 +63,3 @@ pub(crate) fn chunked_optional_multiscalar_mul(
         )
 }
 
-/// Parallel chunked constant-time MSM (Pippenger).
-pub(crate) fn chunked_multiscalar_mul(
-    scalars: &[Scalar],
-    points: &[RistrettoPoint],
-) -> RistrettoPoint {
-    let n = scalars.len();
-    let num_threads = rayon::current_num_threads();
-
-    if n <= CT_MIN_CHUNK || num_threads <= 1 {
-        return RistrettoPoint::multiscalar_mul(scalars, points);
-    }
-
-    let chunk_size = ((n + num_threads - 1) / num_threads).max(CT_MIN_CHUNK);
-
-    scalars
-        .par_chunks(chunk_size)
-        .zip(points.par_chunks(chunk_size))
-        .map(|(sc, pt)| RistrettoPoint::multiscalar_mul(sc, pt))
-        .reduce(|| RistrettoPoint::identity(), |a, b| a + b)
-}

@@ -335,16 +335,13 @@ impl<'a, 'b> ProverCS<'a, 'b> {
             use rand_chacha::ChaCha20Rng;
             use rand::SeedableRng;
 
-            //Step 1: The Deterministic Seed = H(state,"witness_rng"∣∣0x00∣∣self.v_blinding)
             let witness_seed = self.transcript.witness_rng_seed(self.v_blinding.as_bytes());
             let mut os_bytes = [0u8; 32];
 
-            //Step 2: The Fresh OS Entropy
             if std::env::var("MAYA_DETERMINISTIC").ok().as_deref() != Some("1") {
                 thread_rng().fill_bytes(&mut os_bytes);
             }
 
-            //Step 3: The Combination (XOR)
             let mut seed = [0u8; 32];
             for i in 0..32 {
                 seed[i] = witness_seed[i] ^ os_bytes[i];

@@ -3,7 +3,7 @@ name = "maya_ristretto"
 version = "1.0.1"
 edition = "2015"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 categories = ["cryptography"]
 keywords = ["cryptography", "ristretto", "zero-knowledge"]
 autobenches = false
@@ -32,9 +32,20 @@ bincode = "1"
 [features]
 parallel = ["rayon"]
 yoloproofs = []
-production = []
 global_padding = []
 
+
+[[test]]
+name = "pi1"
+required-features = ["yoloproofs"]
+
+[[test]]
+name = "pi2"
+required-features = ["yoloproofs"]
+
+[[test]]
+name = "pi3"
+required-features = ["yoloproofs"]
 
 [[bench]]
 name = "pi1"

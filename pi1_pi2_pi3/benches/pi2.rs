@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 extern crate maya_ristretto;
 use maya_ristretto::r1cs::LinearCombination;
 use maya_ristretto::r1cs::{ConstraintSystem, Prover, R1CSError, R1CSProof, Variable, Verifier};
@@ -39,6 +38,27 @@ const CRITERION_ENABLED: bool = true;
 struct KShuffleGadget;
 
 impl KShuffleGadget {
+    fn bind_statement(
+        transcript: &mut HmacTranscript,
+        k: usize,
+        e_seed: &[u8; 32],
+        k_original: usize,
+        k_fold: usize,
+        num_rounds: usize,
+        block_sizes: &[usize],
+    ) {
+        transcript.append_message(b"dom-sep", b"ShuffleProof");
+        transcript.append_message(b"k", Scalar::from(k as u64).as_bytes());
+        transcript.append_message(b"statement", e_seed);
+        transcript.append_message(b"n", &(k_original as u64).to_le_bytes());
+        transcript.append_message(b"k_fold", &(k_fold as u64).to_le_bytes());
+        transcript.append_message(b"d", &(num_rounds as u64).to_le_bytes());
+        transcript.append_message(b"num_groups", &(block_sizes.len() as u64).to_le_bytes());
+        for &bs in block_sizes {
+            transcript.append_message(b"block_size", &(bs as u64).to_le_bytes());
+        }
+    }
+
     fn fill_cs<CS: ConstraintSystem>(
         cs: &mut CS,
         x: &[Variable],
@@ -96,6 +116,7 @@ impl KShuffleGadget {
         pc_gens: &'b PedersenGens,
         bp_gens: &'b BulletproofGens,
         transcript: &'a mut HmacTranscript,
+        e_seed: &[u8; 32],
         input: &[Scalar],
         output: &[Scalar],
         c1_prime: &[RistrettoPoint],
@@ -113,12 +134,9 @@ impl KShuffleGadget {
             return Err(R1CSError::InputLengthError);
         }
 
-        transcript.append_message(b"dom-sep", b"ShuffleProof");
-        transcript.append_message(b"k", Scalar::from(k as u64).as_bytes());
-        transcript.append_message(b"num_groups", Scalar::from(block_sizes.len() as u64).as_bytes());
-        for &bs in block_sizes {
-            transcript.append_message(b"block_size", Scalar::from(bs as u64).as_bytes());
-        }
+        Self::bind_statement(
+            transcript, k, e_seed, k_original, k_fold, num_rounds, block_sizes,
+        );
 
         let mut prover = Prover::new(bp_gens, pc_gens, transcript);
         let v_blinding = Scalar::random(rng);
@@ -136,6 +154,7 @@ impl KShuffleGadget {
         pc_gens: &'b PedersenGens,
         bp_gens: &'b BulletproofGens,
         transcript: &'a mut HmacTranscript,
+        e_seed: &[u8; 32],
         proof: &R1CSProof,
         input: &[Scalar],
         output_commitment: CompressedRistretto,
@@ -145,23 +164,27 @@ impl KShuffleGadget {
         c2_raw: &[CompressedRistretto],
         e_challenge: &[Scalar],
         f_gens: &[CompressedRistretto],
+        k_fold: usize,
+        num_rounds: usize,
         block_sizes: &[usize],
     ) -> Result<(), R1CSError> {
         let k = input.len();
-        transcript.append_message(b"dom-sep", b"ShuffleProof");
-        transcript.append_message(b"k", Scalar::from(k as u64).as_bytes());
-        transcript.append_message(b"num_groups", Scalar::from(block_sizes.len() as u64).as_bytes());
-        for &bs in block_sizes {
-            transcript.append_message(b"block_size", Scalar::from(bs as u64).as_bytes());
+        let k_original = c1_prime.len();
+        if input.len() != k
+            || block_sizes.iter().try_fold(0usize, |a, &b| a.checked_add(b)) != Some(k_original)
+        {
+            return Err(R1CSError::FormatError);
         }
+        Self::bind_statement(
+            transcript, k, e_seed, k_original, k_fold, num_rounds, block_sizes,
+        );
 
         let mut verifier = Verifier::new(bp_gens, pc_gens, transcript);
         let output_vars = verifier.commit_vec(output_commitment, k);
         let mut cs = verifier.finalize_inputs();
-        let k_original = c1_prime.len();
         Self::fill_cs(&mut cs, &output_vars, input, k_original, block_sizes);
         let phase2_sizes = vec![k_original];
-        cs.verify(proof, c1_prime, c2_prime, c1_raw, c2_raw, e_challenge, f_gens, &phase2_sizes)
+        cs.verify(proof, c1_prime, c2_prime, c1_raw, c2_raw, e_challenge, f_gens, &phase2_sizes, k_fold, num_rounds)
     }
 }
 
@@ -176,7 +199,7 @@ fn derive_challenge_e(
     block_sizes: &[usize],
     n_original: usize,
     n_padded: usize,
-) -> Vec<Scalar> {
+) -> (Vec<Scalar>, [u8; 32]) {
     let verbose = std::env::var("VERBOSE").ok()
         .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .is_some();
@@ -207,6 +230,7 @@ fn derive_challenge_e(
     let t_expand = Instant::now();
     let mut seed = [0u8; 32];
     ts.challenge_bytes(b"e_seed", &mut seed);
+    let e_seed = seed;
 
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -279,21 +303,9 @@ fn derive_challenge_e(
     if verbose {
         eprintln!("[derive_e] n={}: scalar expand: {:?}", n_original, t_expand.elapsed());
     }
-    e
+    (e, e_seed)
 }
 
-// Benchmark-only deterministic RNG.
-// Replace with OsRng or another OS-seeded CSPRNG outside tests/benchmarks.
-#[cfg(all(feature = "parallel", not(feature = "production")))]
-fn deterministic_rand_scalar(index: usize) -> Scalar {
-    use rand::SeedableRng;
-    const DOMAIN_TAG: u64 = 0xD0_53_BE_4C_1A_27_0E_F1;
-    let mut seed = [0u8; 32];
-    seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
-    seed[8..16].copy_from_slice(&DOMAIN_TAG.to_le_bytes());
-    let mut rng = rand::rngs::StdRng::from_seed(seed);
-    Scalar::random(&mut rng)
-}
 
 // File I/O Helpers 
 fn encode_ciphertexts(
@@ -333,70 +345,6 @@ fn store_bytes(path: &str, bytes: &[u8]) -> std::io::Result<usize> {
     Ok(bytes.len())
 }
 
-fn read_ciphertexts(
-    path: &str,
-) -> std::io::Result<(
-    Vec<RistrettoPoint>, 
-    Vec<RistrettoPoint>, 
-    RistrettoPoint,      
-    RistrettoPoint,      
-    RistrettoPoint,      
-    Vec<u8>,            
-    Vec<u8>,             
-)> {
-    let file = File::open(path)?;
-    let mut r = BufReader::new(file);
-    let mut buf8 = [0u8; 8];
-    r.read_exact(&mut buf8)?;
-    let n = u64::from_le_bytes(buf8) as usize;
-
-    #[cfg(feature = "parallel")]
-    let (c1, c2, c1_raw, c2_raw) = {
-        let mut blob = vec![0u8; 2 * n * 32];
-        r.read_exact(&mut blob)?;
-        let s = n * 32;
-        let c1_raw = blob[..s].to_vec();
-        let c2_raw = blob[s..].to_vec();
-        let (r1, r2) = rayon::join(|| batch_decompress(&c1_raw), || batch_decompress(&c2_raw));
-        (r1?, r2?, c1_raw, c2_raw)
-    };
-    #[cfg(not(feature = "parallel"))]
-    let (c1, c2, c1_raw, c2_raw) = {
-        let mut buf32 = [0u8; 32];
-        let mut read_vec = |rdr: &mut BufReader<File>| -> std::io::Result<(Vec<RistrettoPoint>, Vec<u8>)> {
-            let mut pts = Vec::with_capacity(n);
-            let mut raw = Vec::with_capacity(n * 32);
-            for _ in 0..n {
-                rdr.read_exact(&mut buf32)?;
-                raw.extend_from_slice(&buf32);
-                pts.push(
-                    CompressedRistretto::from_slice(&buf32)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}", e)))?
-                        .decompress()
-                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "decompress failed"))?,
-                );
-            }
-            Ok((pts, raw))
-        };
-        let (c1, c1_raw) = read_vec(&mut r)?;
-        let (c2, c2_raw) = read_vec(&mut r)?;
-        (c1, c2, c1_raw, c2_raw)
-    };
-
-    let mut buf32 = [0u8; 32];
-    let decomp = |b: [u8; 32], label: &'static str| -> std::io::Result<RistrettoPoint> {
-        CompressedRistretto::from_slice(&b)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}", e)))?
-            .decompress()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("decompress {} failed", label)))
-    };
-    r.read_exact(&mut buf32)?; let g = decomp(buf32, "g")?;
-    r.read_exact(&mut buf32)?; let f = decomp(buf32, "f")?;
-    r.read_exact(&mut buf32)?; let h = decomp(buf32, "h")?;
-
-    Ok((c1, c2, g, f, h, c1_raw, c2_raw))
-}
-
 fn write_proof_bundle(
     path: &str,
     proof: &R1CSProof,
@@ -423,56 +371,6 @@ fn write_proof_bundle(
     let fh = w.into_inner()?;
     fh.sync_all()?;
     Ok(std::fs::metadata(path)?.len() as usize)
-}
-
-fn read_proof_bundle(
-    path: &str,
-) -> std::io::Result<(
-    R1CSProof,
-    CompressedRistretto,
-    Vec<RistrettoPoint>, 
-    Vec<RistrettoPoint>, 
-    Vec<u8>,            
-    Vec<u8>,             
-)> {
-    let file = File::open(path)?;
-    let mut r = BufReader::new(file);
-    let mut buf8 = [0u8; 8];
-    let mut buf32 = [0u8; 32];
-
-    r.read_exact(&mut buf8)?;
-    let proof_len = u64::from_le_bytes(buf8) as usize;
-    let mut proof_bytes = vec![0u8; proof_len];
-    r.read_exact(&mut proof_bytes)?;
-    let proof: R1CSProof = R1CSProof::from_bytes(&proof_bytes).expect("proof deserialize");
-
-    r.read_exact(&mut buf32)?;
-    let out_commitment = CompressedRistretto::from_slice(&buf32)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}", e)))?;
-
-    let read_blob = |rdr: &mut BufReader<File>| -> std::io::Result<Vec<u8>> {
-        let mut b8 = [0u8; 8];
-        rdr.read_exact(&mut b8)?;
-        let cnt = u64::from_le_bytes(b8) as usize;
-        let mut blob = vec![0u8; cnt * 32];
-        rdr.read_exact(&mut blob)?;
-        Ok(blob)
-    };
-
-    let c1p_blob = read_blob(&mut r)?;
-    let c2p_blob = read_blob(&mut r)?;
-
-    #[cfg(feature = "parallel")]
-    let (c1_prime, c2_prime) = {
-        let (r1, r2) = rayon::join(|| batch_decompress(&c1p_blob), || batch_decompress(&c2p_blob));
-        (r1?, r2?)
-    };
-    #[cfg(not(feature = "parallel"))]
-    let c1_prime = batch_decompress(&c1p_blob)?;
-    #[cfg(not(feature = "parallel"))]
-    let c2_prime = batch_decompress(&c2p_blob)?;
-
-    Ok((proof, out_commitment, c1_prime, c2_prime, c1p_blob, c2p_blob))
 }
 
 
@@ -800,9 +698,6 @@ fn custom_benchmark(c: &mut Criterion) {
 
         // [3] Rerandomization
         let t_rerand_start = Instant::now();
-        #[cfg(all(feature = "parallel", not(feature = "production")))]
-        let r_values: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-        #[cfg(not(feature = "parallel"))]
         let r_values: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng)).collect();
 
         #[cfg(feature = "parallel")]
@@ -829,7 +724,7 @@ fn custom_benchmark(c: &mut Criterion) {
         let t_e_derive_p_start = Instant::now();
         let c1p_bytes = batch_compress(&c1_prime);
         let c2p_bytes = batch_compress(&c2_prime);
-        let input_padded = derive_challenge_e(
+        let (input_padded, e_seed) = derive_challenge_e(
             &pc_gens, &bp_gens,
             &c1_bytes, &c2_bytes, &c1p_bytes, &c2p_bytes,
             block_sizes, n_input, circuit_n,
@@ -848,7 +743,7 @@ fn custom_benchmark(c: &mut Criterion) {
         let t_proof_start = Instant::now();
         let mut prover_transcript = Transcript::new(b"MAYA-Shuffle-v1");
         let (proof, out_commitment) = KShuffleGadget::prove(
-            &pc_gens, &bp_gens, &mut prover_transcript,
+            &pc_gens, &bp_gens, &mut prover_transcript, &e_seed,
             &input_padded, &output_padded,
             &c1_prime, &c2_prime, &f_gens_vec, &r_primes,
             k, d, block_sizes, &mut rng,
@@ -896,7 +791,7 @@ fn custom_benchmark(c: &mut Criterion) {
     
         // [2] Derive e
         let t_e_start = Instant::now();
-        let input_padded_r = derive_challenge_e(
+        let (input_padded_r, e_seed_r) = derive_challenge_e(
             &v_pc_gens, &v_bp_gens,
             &c1_orig_bytes, &c2_orig_bytes,
             &c1p_r_bytes, &c2p_r_bytes,
@@ -919,11 +814,11 @@ fn custom_benchmark(c: &mut Criterion) {
         let e_original_r = &input_padded_r[..n_input];
         let mut verifier_transcript = Transcript::new(b"MAYA-Shuffle-v1");
         let result = KShuffleGadget::verify(
-            &v_pc_gens, &v_bp_gens, &mut verifier_transcript,
+            &v_pc_gens, &v_bp_gens, &mut verifier_transcript, &e_seed_r,
             &proof_r, &input_padded_r, out_commitment_r,
             &c1_prime_c, &c2_prime_c,
             &c1_raw_c, &c2_raw_c, e_original_r,
-            &f_gens_v_c, block_sizes,
+            &f_gens_v_c, k, d, block_sizes,
         );
         assert!(result.is_ok(),
             "Verification failed N={}/k={}/d={}: {:?}", n_input, k, d, result.err());
@@ -1010,9 +905,6 @@ fn custom_benchmark(c: &mut Criterion) {
 
             let idx_b = generate_hetero_block_permutation(block_sizes, &mut rng_b);
 
-            #[cfg(all(feature = "parallel", not(feature = "production")))]
-            let rv_b: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-            #[cfg(not(feature = "parallel"))]
             let rv_b: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng_b)).collect();
 
             #[cfg(feature = "parallel")]
@@ -1036,7 +928,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let c1p_b_bytes = batch_compress(&c1p_b);
             let c2p_b_bytes = batch_compress(&c2p_b);
 
-            let inp_b = derive_challenge_e(
+            let (inp_b, e_seed_b) = derive_challenge_e(
                 &pc_gens, &bp_gens,
                 &c1_b_bytes, &c2_b_bytes, &c1p_b_bytes, &c2p_b_bytes,
                 block_sizes, n_input, circuit_n,
@@ -1053,7 +945,7 @@ fn custom_benchmark(c: &mut Criterion) {
                     let mut t = Transcript::new(b"MAYA-Shuffle-v1");
                     let mut bench_rng = rand::thread_rng();
                     KShuffleGadget::prove(
-                        &pc_gens, &bp_gens, &mut t,
+                        &pc_gens, &bp_gens, &mut t, &e_seed_b,
                         &inp_b, &out_b, &c1p_b, &c2p_b, &f_gens_b, &rp_b,
                         k, d, block_sizes, &mut bench_rng,
                     ).expect("prover bench failed");
@@ -1076,9 +968,6 @@ fn custom_benchmark(c: &mut Criterion) {
 
             let idx_v = generate_hetero_block_permutation(block_sizes, &mut rng_v);
 
-            #[cfg(all(feature = "parallel", not(feature = "production")))]
-            let rv_v: Vec<Scalar> = (0..n_input).map(|j| deterministic_rand_scalar(j)).collect();
-            #[cfg(not(feature = "parallel"))]
             let rv_v: Vec<Scalar> = (0..n_input).map(|_| Scalar::random(&mut rng_v)).collect();
 
             #[cfg(feature = "parallel")]
@@ -1102,7 +991,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let c1p_v_bytes = batch_compress(&c1p_v);
             let c2p_v_bytes = batch_compress(&c2p_v);
 
-            let inp_v = derive_challenge_e(
+            let (inp_v, e_seed_v) = derive_challenge_e(
                 &pc_gens, &bp_gens,
                 &c1_v_bytes, &c2_v_bytes, &c1p_v_bytes, &c2p_v_bytes,
                 block_sizes, n_input, circuit_n,
@@ -1118,7 +1007,7 @@ fn custom_benchmark(c: &mut Criterion) {
             let mut pt = Transcript::new(b"MAYA-Shuffle-v1");
             let mut setup_rng = rand::thread_rng();
             let (proof_v, out_com_v) = KShuffleGadget::prove(
-                &pc_gens, &bp_gens, &mut pt,
+                &pc_gens, &bp_gens, &mut pt, &e_seed_v,
                 &inp_v, &out_v, &c1p_v, &c2p_v, &f_gens_v2, &rp_v,
                 k, d, block_sizes, &mut setup_rng,
             ).expect("prove for verifier bench failed");
@@ -1133,11 +1022,11 @@ fn custom_benchmark(c: &mut Criterion) {
                 b.iter(|| {
                     let mut t = Transcript::new(b"MAYA-Shuffle-v1");
                     let res = KShuffleGadget::verify(
-                        &pc_gens, &bp_gens, &mut t,
+                        &pc_gens, &bp_gens, &mut t, &e_seed_v,
                         &proof_v, &inp_v, out_com_v,
                         &c1p_v_c, &c2p_v_c,
                         &c1_v_c, &c2_v_c, e_v,
-                        &f_gens_v2_c, block_sizes,
+                        &f_gens_v2_c, k, d, block_sizes,
                     );
                     assert!(res.is_ok(), "verifier bench failed: {:?}", res.err());
                 });

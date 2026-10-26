@@ -10,6 +10,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 
+#[derive(Clone)]
 pub struct HmacTranscript {
     state: [u8; 32],
 }
